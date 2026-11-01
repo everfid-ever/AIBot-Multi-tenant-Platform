@@ -286,6 +286,17 @@ type httpClientFunc func(*http.Request) (*http.Response, error)
 
 func (f httpClientFunc) Do(request *http.Request) (*http.Response, error) { return f(request) }
 
+func TestCancelledIssuedSendIsAmbiguousAndDoesNotLeakToken(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := wecom.OfficialSender{Tokens: &recordingTokens{}, BaseURL: "https://unit.test", Client: httpClientFunc(func(*http.Request) (*http.Response, error) { cancel(); return nil, ctx.Err() })}
+	_, err := sender.SendText(ctx, channel.ReplyDestination{TenantID: "tenant", ChannelBindingID: "binding", ExternalAccountID: "account", ConfigVersion: 1}, "user", "answer", "client")
+	var ambiguous channel.AmbiguousDeliveryError
+	if !errors.As(err, &ambiguous) || !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "cached-token") {
+		t.Fatal(err)
+	}
+}
+
 func testMaterial() protocol.VerificationMaterial {
 	return protocol.VerificationMaterial{Token: "callback-token", EncodingAESKey: base64.RawStdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")), ReceiveID: "ww_corp", AgentID: 218}
 }

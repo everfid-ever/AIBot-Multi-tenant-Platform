@@ -161,7 +161,7 @@ func TestOfficialSenderUsesReplyUUIDAndClassifiesHTTPResults(t *testing.T) {
 			var target channel.RetryableDeliveryError
 			return errors.As(err, &target)
 		}},
-		{name: "server", status: 503, response: `{"code":1,"msg":"unavailable"}`, checkErr: func(err error) bool { var target channel.RetryableDeliveryError; return errors.As(err, &target) }},
+		{name: "server", status: 503, response: `{"code":1,"msg":"unavailable"}`, checkErr: func(err error) bool { var target channel.AmbiguousDeliveryError; return errors.As(err, &target) }},
 		{name: "invalid message", status: 400, response: `{"code":230001,"msg":"message not found"}`, checkErr: func(err error) bool { var target channel.PermanentDeliveryError; return errors.As(err, &target) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -114,11 +114,11 @@ func (a *Adapter) Decode(_ context.Context, callback channel.VerifiedCallback) (
 func (a *Adapter) Deliver(ctx context.Context, request channel.DeliveryRequest) (channel.DeliveryResult, error) {
 	if a.Sender == nil || request.Event.TenantID == "" || request.Event.ChannelBindingID == "" || request.Target.Channel != "feishu" ||
 		request.Target.ExternalMessageID == "" || len(request.Content) == 0 || request.ClientRequestID == "" {
-		return channel.DeliveryResult{}, runtime.ErrInvariantViolation
+		return channel.DeliveryResult{}, channel.PermanentDeliveryError{Err: runtime.ErrInvariantViolation, Class: "invalid_delivery"}
 	}
 	sum := sha256.Sum256(request.Content)
 	if request.ContentDigest != hex.EncodeToString(sum[:]) {
-		return channel.DeliveryResult{}, runtime.ErrVersionMismatch
+		return channel.DeliveryResult{}, channel.PermanentDeliveryError{Err: runtime.ErrVersionMismatch, Class: "content_digest_mismatch"}
 	}
 	destination := channel.ReplyDestination{TenantID: request.Event.TenantID, Channel: request.Target.Channel,
 		ChannelBindingID: request.Event.ChannelBindingID, ExternalAccountID: request.Target.ExternalAccountID,
@@ -259,7 +259,7 @@ func (s OfficialSender) reply(ctx context.Context, destination channel.ReplyDest
 	}
 	client, err := s.Clients.ResolveFeishuClient(ctx, destination)
 	if err != nil {
-		return "", err
+		return "", channel.RetryableDeliveryError{Err: err}
 	}
 	if client == nil {
 		return "", runtime.ErrVersionMismatch
@@ -280,6 +280,8 @@ func (s OfficialSender) reply(ctx context.Context, destination channel.ReplyDest
 		}
 		providerErr := fmt.Errorf("feishu reply code=%d status=%d: %s", resp.Code, status, resp.Msg)
 		switch {
+		case status == 408 || status >= 500:
+			return "", channel.AmbiguousDeliveryError{Err: providerErr}
 		case resp.Code == 99991400 || resp.Code == 99991401 || status == 429:
 			delay := time.Second
 			if resp.ApiResp != nil {
@@ -288,7 +290,7 @@ func (s OfficialSender) reply(ctx context.Context, destination channel.ReplyDest
 				}
 			}
 			return "", channel.RetryableDeliveryError{Err: providerErr, RetryAfter: delay}
-		case resp.Code == 99991663 || resp.Code == 99991664 || resp.Code == 99991671 || status == 408 || status >= 500:
+		case resp.Code == 99991663 || resp.Code == 99991664 || resp.Code == 99991671:
 			return "", channel.RetryableDeliveryError{Err: providerErr}
 		default:
 			return "", channel.PermanentDeliveryError{Err: providerErr, Class: "provider_rejected"}

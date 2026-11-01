@@ -119,7 +119,8 @@ SDK 事件已同步持久，续提交不会再运行 SDK。result_payload 独立
 | result-before-commit | 冻结结果保存后、terminal/Outbox 提交前 | 原 result_ref/digest 不变，接管不再调用模型。 |
 | p3 | terminal 已提交、reply PublishReply 前 | session_commit、result_payload、已领取 reply Outbox。 |
 | p4-before-send | Ledger claim 后、provider 调用前 | 旧发送前边界，不能证明 P4 已接受。 |
-| p4 | provider 成功接受且返回消息 ID 后、Ledger sent 前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4 | provider 成功接受且返回消息 ID 后、回执落库前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4-receipt | delivery_receipt 已落库、Ledger sent 前 | 接管后核对摘要，只补 sent，不再次调用渠道。 |
 | tool-effect | 工具业务效果完成后、工具结果提交前 | 按业务键查外部效果，恢复不能增加效果数。 |
 
 仅 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 注册 `/test/failover/<point>/arm|status|release`，用本地 WebUI token 鉴权。arm 可带 tenant_id/request_id 过滤；status 回显命中身份/evidence。暂停控制面是进程内测试设施，不续 lease、不修改业务状态、不替系统重投。标准接管在命中后杀 owner，不对 survivor release。

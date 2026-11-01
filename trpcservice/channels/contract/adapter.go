@@ -20,7 +20,9 @@ func (e AmbiguousDeliveryError) Error() string {
 }
 func (e AmbiguousDeliveryError) Unwrap() error { return e.Err }
 
-// RetryableDeliveryError optionally carries a provider-requested retry delay.
+// RetryableDeliveryError asserts the final message was NOT accepted (for
+// example, explicit rate-limit rejection or a failure before issuing send).
+// Timeouts, cancellation and unknown transport errors must be ambiguous.
 type RetryableDeliveryError struct {
 	Err        error
 	RetryAfter time.Duration
@@ -206,6 +208,7 @@ const (
 type ReconciliationRequest struct {
 	Event           ReplyEvent
 	ClientRequestID string
+	ContentDigest   string
 }
 
 type ReconciliationResult struct {

@@ -15,6 +15,46 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 )
 
+func TestReconciliationCannotConfirmAnotherRouteOrContent(t *testing.T) {
+	ctx := context.Background()
+	mailbox := NewMemoryMailbox()
+	adapter := &Adapter{Mailbox: mailbox}
+	sum := sha256.Sum256([]byte("answer"))
+	digest := hex.EncodeToString(sum[:])
+	event := channel.ReplyEvent{SchemaVersion: 1, TenantID: "tenant", RequestID: "request", ChannelBindingID: "binding", ConfigVersion: 1, ContentRef: "result://request", Target: channel.DeliveryTarget{Channel: "webui", ExternalAccountID: "account", ExternalUserID: "user", ExternalChatID: "chat"}}
+	if _, err := adapter.Deliver(ctx, channel.DeliveryRequest{Event: event, ClientRequestID: "client", Target: event.Target, Content: []byte("answer"), ContentDigest: digest}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := adapter.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: "client", ContentDigest: digest})
+	if err != nil || r.Status != channel.ReconciliationDelivered {
+		t.Fatal(r, err)
+	}
+	for _, field := range []string{"account", "user", "chat", "binding", "ref", "config", "digest"} {
+		x := event
+		expected := digest
+		switch field {
+		case "account":
+			x.Target.ExternalAccountID = "other"
+		case "user":
+			x.Target.ExternalUserID = "other"
+		case "chat":
+			x.Target.ExternalChatID = "other"
+		case "binding":
+			x.ChannelBindingID = "other"
+		case "ref":
+			x.ContentRef = "other"
+		case "config":
+			x.ConfigVersion = 2
+		case "digest":
+			expected = "different"
+		}
+		r, err = adapter.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: x, ClientRequestID: "client", ContentDigest: expected})
+		if err != nil || r.Status != channel.ReconciliationUnknown {
+			t.Fatalf("confirmed changed %s: %+v %v", field, r, err)
+		}
+	}
+}
+
 func TestAdapterVerifiesAndDecodesBrowserMessage(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	body, err := json.Marshal(inboundEnvelope{SchemaVersion: 1, ExternalAccountID: "local-account",

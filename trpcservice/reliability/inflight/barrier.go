@@ -18,6 +18,7 @@ const (
 	PointP4BeforeProviderDelivery    Point = "p4_delivery_claimed_before_provider_send"
 	PointP2DuringModelResponse       Point = "p2_model_accepted_before_result"
 	PointP4AfterProviderAccepted     Point = "p4_provider_accepted_before_confirmation"
+	PointP4ReceiptPersisted          Point = "p4_receipt_persisted_before_ledger"
 	PointToolEffectBeforeCommit      Point = "tool_effect_completed_before_result_commit"
 	PointResultPersistedBeforeCommit Point = "result_persisted_before_terminal_commit"
 )

@@ -404,7 +404,7 @@ func TestPermanentFailureReachesFailedTerminal(t *testing.T) {
 	if err != nil || record.State != messaging.DeliveryFailed || record.LastErrorClass != "recipient_blocked" {
 		t.Fatalf("record=%#v err=%v", record, err)
 	}
-	if err := service.Deliver(context.Background(), event); err != nil || adapter.calls != 1 {
+	if err := service.Deliver(context.Background(), event); !errors.As(err, &terminal) || adapter.calls != 1 {
 		t.Fatalf("terminal replay calls=%d err=%v", adapter.calls, err)
 	}
 }
@@ -413,7 +413,7 @@ func TestRetryableFailureStopsAtMaxAttempts(t *testing.T) {
 	store := memory.New()
 	result := messaging.ResultRecord{TenantID: "tenant", RequestID: "request", ResultRef: "result://request", ContentDigest: "digest", Content: []byte("done"), KeyVersion: 1}
 	_ = store.PutResult(context.Background(), result)
-	adapter := &adapterStub{err: errors.New("temporary")}
+	adapter := &adapterStub{err: channel.RetryableDeliveryError{Err: errors.New("explicitly not accepted")}}
 	service := Service{Results: store, Ledger: store, Adapters: resolverStub{adapter: adapter}, Owner: "adapter-1", MaxAttempts: 2, DefaultRetryDelay: time.Nanosecond}
 	event := testReplyEvent(result.ResultRef)
 	if err := service.Deliver(context.Background(), event); err == nil {
@@ -484,8 +484,8 @@ func TestDeliveryDoesNotMarkProviderResponsesWithoutDeliveryEvidenceAsSent(t *te
 			if getErr != nil {
 				t.Fatal(getErr)
 			}
-			if name == "not-delivered" && record.State != messaging.DeliveryRetryWait {
-				t.Fatalf("record=%#v, want retry wait", record)
+			if name == "not-delivered" && record.State != messaging.DeliveryAmbiguous {
+				t.Fatalf("record=%#v, want ambiguous", record)
 			}
 			if name == "missing-provider-message-id" && record.State != messaging.DeliveryAmbiguous {
 				t.Fatalf("record=%#v, want ambiguous", record)

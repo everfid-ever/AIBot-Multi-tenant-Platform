@@ -1,5 +1,47 @@
 # 在途任务接管与幂等投递 — 设计文档
 
+## 000008：P4 持久回执、保守判定与受控处置
+
+当前将“渠道已返回成功”和“可恢复的发送证据已保存”分开。发送正常返回 Delivered=true 与非空 ProviderMessageID 后，先把不可变回执写入 delivery_receipt，再把 Ledger 从 sending 改为 sent。新 owner 遇到 ambiguous 时先查回执，完整匹配后补 sent，不再次调用渠道；没有回执才使用渠道真实查询能力。此机制覆盖**回执落库后、Ledger 确认前**的故障，不消除渠道接受到回执落库之前的窗口。
+
+### delivery_receipt 字段表
+
+| 字段 | 类型与约束 | 用途 |
+|---|---|---|
+| `tenant_id` | text，非空；联合主键/外键 | 租户范围。 |
+| `delivery_key` | text，非空；联合主键/外键 | 原回复坐标，故障不换键。 |
+| `segment_no` | integer >= 0；联合主键/外键 | 单个分段，与 delivery_ledger 关联。 |
+| `client_request_id` | text，非空白 | 实际发送使用的稳定请求 ID。 |
+| `provider_message_id` | text，非空白，长度 1–1024 | 渠道正常成功响应给出的消息 ID。 |
+| `plan_digest` | 64 位小写十六进制 SHA-256 | 冻结 Renderer/Format/整体内容摘要/分段数。 |
+| `route_digest` | 64 位小写 SHA-256 | tenant/request/binding/config/content_ref/目标账号、用户、会话及事件语义；不包含会变化的 traceparent。 |
+| `segment_digest` | 64 位小写 SHA-256 | 本段实际字节摘要；分段数相同但边界改变也不能误复用。 |
+| `created_at` | timestamptz，默认数据库 now() | 回执保存时间，不是客户端显示时间。 |
+
+仅保存元数据和摘要，不复制回复正文、令牌或凭据。PutProviderReceipt 在 sending 行上校验 owner、version、client request ID、有效租期并取行锁；同键只接受完全一致的回执，不覆盖 Provider ID 或摘要。失权旧 owner 不能补写一份“成功”。正常 PG Ledger 和内存测试实现支持该接口；自定义 Ledger 须实现 ProviderReceiptStore 或显式注入 Service.Receipts，否则没有这段 journal 保证。
+
+### 自动判定与剩余窗口
+
+| 事实或错误 | 持久状态 / 动作 | 是否自动再发送 |
+|---|---|---|
+| 成功回执已保存，Ledger 未确认 | 校验原键、计划、路由、分段字节后补 sent | 否；WeCom/Feishu 也可使用这一已落库证据。 |
+| 回执与本次路由/分段不符，或回执读取异常 | 继续不确定核对，不能回退为“无回执” | 否。 |
+| 普通未分类错误、发出请求后取消、续租失败、无明确结果或矛盾结果 | ambiguous | 否；只有明确 RetryableDeliveryError 表示未接受才进入 retry_wait。 |
+| 明确限流拒绝、发送前取凭据失败 | retry_wait，保留原 ID 与内容 | 可以。 |
+| 渠道 HTTP 408/5xx 或服务器系统错误 | ambiguous；不能以有限时间去重推定可无限重放 | 否。 |
+| WebUI 正向查询且身份/内容完全匹配 | sent | 否；不存在结果时靠持久唯一请求键保证同键重试安全。 |
+| failed 分段，包括 reconcile_exhausted | TerminalError 阻断后续分段 | 否；重放不能越过失败段去发送后半答案。 |
+
+WebUI 查询现在核对 tenant、binding、config、账号、用户、会话、原 request、client request ID、content_ref、本段内容摘要和确定性 Provider ID，不能仅凭原 request 相同就确认。当前 WeCom/Feishu 没有新增按请求键查询的适配器，也没有把各自有限/非请求级去重提升为永久保证。发送成功但响应或 journal 丢失时仍可能需要外部证据和人工处置。分段是逐段交付，不承诺整条长答案在客户端原子显示。
+
+### 查询与处置契约
+
+GET /ops/delivery/incident 要求部署管理员 token 和显式 tenant_id/delivery_key/segment_no，返回 Ledger、可用回执及最多 100 条处置元数据，不返回正文或秘密。详情为多条只读查询的观察结果，不能当成锁；处置仍以最新 version CAS 为准。
+
+POST /ops/delivery/resolve 保留 delivered/not_delivered/retry_not_delivered 三种决定：已有成功回执时，负向决定及不一致 Provider ID 会被 SQL 条件拒绝；sent 不可重开。Ledger CAS、处置证据和必要的原 Outbox 重调度仍为同一事务。响应丢失后按同一 expected_version/actor/evidence/decision/provider 重试直接确认原操作，不再次增加版本或重调度；同坐标不同证据返回幂等冲突。
+
+HTTP actor 存为 deployment-admin/<请求中的操作人标签>：token 证明部署管理员权限，标签不等于已认证的人类身份。JSON 重复键、未知字段、控制字符、尾随数据和超限正文均拒绝；Bot 凭据不能调用此接口。自动核对与人工处置由版本 CAS 互斥，不能以超时或客户端暂未显示证明未发送。
+
 ## 000007：完成候选与治理结算恢复
 
 ### 当前恢复状态判定与 SchemaVersion=2
@@ -23,7 +65,7 @@ governance.Finalization.Validate 核对预约/政策/tenant/request、model/toke
 
 恢复矛盾原因使用 completion_conflict、legacy_result_conflict、sealed_result_missing、closed_reservation_without_completion。参与 TaskPlans 的请求先保存同原因 failed 计划，再提交 failed terminal；若两步之间再次崩溃，下一 owner 重入同一路径，不尝试用普通任务失败文本覆盖已有可疑 result_payload。该异常分支只有 audit，无用户回复，不代表成功完成或已通知用户；需运维核查原证据。普通、可确认的任务失败仍提交既有安全失败回复。
 
-本次无新增数据库迁移，依然要求 000007。自定义会话 Store 还需实现 TerminalHistoryReader，生产 PG 和本地测试实现均已接入。新 Worker 的终态历史投影详见[会话设计](../conversation-continuity/design.md#重试历史的读取视图)。
+完成候选/终态投影沿用原表；当前部署须执行至 000008。自定义会话 Store 还需实现 TerminalHistoryReader，生产 PG 和本地测试实现均已接入。新 Worker 的终态历史投影详见[会话设计](../conversation-continuity/design.md#重试历史的读取视图)。
 
 `execution_completion` 是内部不可变完成日志，不能由 Delivery 当成最终回复读取。原流程在结算之后、PutResult 之前崩溃会留下“预约已关闭、无冻结答案”；新 owner 再 Begin 会被拒绝。现在把已审核的输出和结算意图先持久化，再执行可幂等重放的治理写入。
 
@@ -218,7 +260,7 @@ Runner 在治理结算与 PutResult 前 ValidateCompletion，避免未完成任�
 ## Ledger 状态的读取顺序
 
 1. 先校验同一 delivery key 对应的 renderer、format、内容摘要与分段数。计划不兼容时拒绝，不能重新渲染成另一个答案继续发送。
-2. 对当前分段尝试 Claim。已 sent/failed 跳过；有效 sending/pending/retry_wait 可能返回延后；ambiguous 走核对。
+2. 对当前分段尝试 Claim。已 sent 仅在证据适用且一致时跳过发送；已 failed 返回 TerminalError 并阻断后段；有效 sending/pending/retry_wait 可能返回延后；ambiguous 先查持久回执，再走渠道核对。
 3. 只有成功取得发送资格的分支调用 adapter。结果成功却缺少 provider ID 也不能直接写 sent。
 4. 根据明确永久错误、可重试错误或不确定错误分别保存状态；写入失败时保留原身份供下一次读取裁决。
 5. 后续事件从原计划重新遍历各段，而非重新执行模型。人工确认送达也沿用原键，已 sent 的段不会重发。
@@ -695,7 +737,7 @@ Ledger 的 sent/failed 视为发送流程终态，但只有 failed/reconcile_exh
 
 allow/ask 是授权策略，replay_safe/idempotent_key/queryable/manual 是恢复策略，二者正交。普通允许调用也要持久化；确认工具只是增加一次性 grant 和结果镜像。生产组合根注入 execution store 与 payload key resolver，缺少 durable result 能力拒绝降级。旧 nil Store 的独立接口不提供分布式保证。
 
-内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。P4 中若匹配的 provider receipt 已落库，可直接补齐 Ledger；回执也未落库的剩余窗口仍需下游可靠去重/查询或外部处置证据。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
 
 ## 实体关系与唯一性的层级
 

@@ -1,5 +1,11 @@
 # 在途任务接管与幂等投递 — 完整实现说明
 
+## P4 现在先看哪份证据
+
+正常渠道响应回来后，先保存 Provider ID、原路由/计划与分段字节摘要，再完成 Ledger。接管者若找到匹配的持久回执，只补本地确认；不需要借助渠道重发验证成功。回执尚未保存就退出时，系统仍不能推断没发出去：未分类错误、取消、失权及服务端错误按不确定处理，没有可靠查询就保留事件并走证据化处置。
+
+这也解释了为什么“有 uuid/内容去重”不足以承诺任意晚到重试安全。当前仅对持久回执或真实查询证据自动确认；不会给 WeCom/Feishu 发明不存在的请求状态 API。WebUI 的查询具有本地持久唯一键，并核对完整目的地与内容。失败段会阻断剩余分段，运维确认已送达后才沿原 Outbox 继续。详情见 [P4 状态与数据模型](design.md#000008p4-持久回执保守判定与受控处置)。
+
 ## 为什么有幂等键还要先查询
 
 幂等键限制重复业务效果，但每次直接重放仍可能重复调用供应商、得到处理中回执或依赖已改变的本地期望值。local_note 现在先查已提交业务行并认证原密文，再补回工具结果和检查点。MCP 可配置同端点只读查询：completed 不再写，pending/unknown 不猜测，not_found 也仍须同幂等键继续，因为旧请求可能在查询后才到达。
@@ -76,7 +82,7 @@
 
 一份逻辑答案可能因渠道长度限制产生多个 segment。Ledger 的保护粒度是每个 segment；用户看到的气泡数量与最终答案数量需要分开统计。
 
-假设答案有三段：0 已 sent、1 ambiguous、2 尚未发送。重新收到原 reply 时，0 跳过发送，1 进入核对，未知不能被当作“没发”直接重发。第 1 段被证据确认后，重调度原 Outbox 可以让尚未完成的分段沿原计划推进。分段循环对已 failed 的段也会跳过，因此不能把单段 failed 解释为整个答案必然完整送达；需要逐段检查状态与客户端内容。
+假设答案有三段：0 已 sent、1 ambiguous、2 尚未发送。重新收到原 reply 时，0 跳过发送，1 进入核对，未知不能被当作“没发”直接重发。第 1 段被证据确认后，重调度原 Outbox 可以让尚未完成的分段沿原计划推进。分段循环遇到已 failed 的段会返回 TerminalError 并停止，重复事件也不能绕过失败段发送后段；不能把单段 failed 解释为整个答案完整送达，需要逐段检查状态与客户端内容。
 
 还必须区分下游两种能力：可靠请求键去重能够让同键重试不重复产生可见消息；可靠查询只有在能证明原操作已送达或明确未被接受、且旧发送不会随后生效时，才足以指导安全重试。普通最终一致查询、“当前没查到”或仅有内容级短期去重都不足以自动推出至多一次。
 
@@ -140,7 +146,7 @@ fence 约束有效提交，不会撤销已经发生的外部副作用，也不�
 
 Delivery 先解析持久化内容和冻结路由，固定 renderer/format/内容摘要和分段计划，再 ClaimDelivery。仅领取成功才调用 adapter；发送期间续 claim。成功接受且有 ProviderMessageID 后才 FinishDelivery(sent)；已 sent 分段跳过发送。短暂错误进 retry_wait，永久或尝试耗尽进 failed。不确定错误进 ambiguous，禁止因超时推断未送达。
 
-内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。P4 中若匹配的 provider receipt 已落库，可直接补齐 Ledger；回执也未落库的剩余窗口仍需下游可靠去重/查询或外部处置证据。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
 
 ### 为什么不能只做发送重试
 
@@ -154,7 +160,8 @@ Outbox 解决结果提交后的漏发调度，Ledger 解决本地多 sender 的�
 | result-before-commit | 冻结结果保存后、terminal/Outbox 提交前 | 原 result_ref/digest 不变，接管不再调用模型。 |
 | p3 | terminal 已提交、reply PublishReply 前 | session_commit、result_payload、已领取 reply Outbox。 |
 | p4-before-send | Ledger claim 后、provider 调用前 | 旧发送前边界，不能证明 P4 已接受。 |
-| p4 | provider 成功接受且返回消息 ID 后、Ledger sent 前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4 | provider 成功接受且返回消息 ID 后、回执落库前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4-receipt | delivery_receipt 已落库、Ledger sent 前 | 接管后核对摘要，只补 sent，不再次调用渠道。 |
 | tool-effect | 工具业务效果完成后、工具结果提交前 | 按业务键查外部效果，恢复不能增加效果数。 |
 
 仅 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 注册 `/test/failover/<point>/arm|status|release`，用本地 WebUI token 鉴权。arm 可带 tenant_id/request_id 过滤；status 回显命中身份/evidence。暂停控制面是进程内测试设施，不续 lease、不修改业务状态、不替系统重投。标准接管在命中后杀 owner，不对 survivor release。

@@ -115,7 +115,9 @@ func (a *Adapter) Deliver(ctx context.Context, request channel.DeliveryRequest) 
 }
 
 func (a *Adapter) ReconcileDelivery(ctx context.Context, request channel.ReconciliationRequest) (channel.ReconciliationResult, error) {
-	if a == nil || a.Mailbox == nil || request.Event.TenantID == "" || request.ClientRequestID == "" {
+	if a == nil || a.Mailbox == nil || request.Event.TenantID == "" || request.ClientRequestID == "" || request.Event.RequestID == "" ||
+		request.Event.ChannelBindingID == "" || request.Event.ConfigVersion < 1 || request.Event.ContentRef == "" || request.ContentDigest == "" || request.Event.Target.Channel != "webui" ||
+		request.Event.Target.ExternalAccountID == "" || request.Event.Target.ExternalUserID == "" || request.Event.Target.ExternalChatID == "" {
 		return channel.ReconciliationResult{}, runtime.ErrInvariantViolation
 	}
 	message, err := a.Mailbox.GetMessageByClientRequestID(ctx, request.Event.TenantID, request.ClientRequestID)
@@ -125,7 +127,10 @@ func (a *Adapter) ReconcileDelivery(ctx context.Context, request channel.Reconci
 	if err != nil {
 		return channel.ReconciliationResult{}, err
 	}
-	if message.RequestID != request.Event.RequestID || message.ProviderMessageID == "" {
+	if message.TenantID != request.Event.TenantID || message.ChannelBindingID != request.Event.ChannelBindingID || message.ConfigVersion != request.Event.ConfigVersion ||
+		message.ExternalAccountID != request.Event.Target.ExternalAccountID || message.ExternalUserID != request.Event.Target.ExternalUserID || message.ExternalChatID != request.Event.Target.ExternalChatID ||
+		message.ClientRequestID != request.ClientRequestID || message.ContentRef != request.Event.ContentRef || request.ContentDigest == "" || message.ContentDigest != request.ContentDigest ||
+		message.RequestID != request.Event.RequestID || message.ProviderMessageID != providerMessageID(request.ClientRequestID) {
 		return channel.ReconciliationResult{Status: channel.ReconciliationUnknown}, nil
 	}
 	return channel.ReconciliationResult{Status: channel.ReconciliationDelivered, ProviderMessageID: message.ProviderMessageID}, nil

@@ -1,14 +1,24 @@
 # 在途任务接管与幂等投递 — 发布与运维
 
+## 000008 与 P4 事件处置
+
+当前版本须先执行 000008_delivery_receipt。发布前保留所有仍未结束的 Ledger、receipt、Outbox、结果与路由配置；删除 receipt 会丢失已经取得的自动恢复证据。降级旧发送器会恢复旧错误分类，不能在仍有不确定投递时把新旧实例混跑当作兼容发布。000008 down 会删除回执表，仅在处理完在途数据并备份后考虑执行。
+
+先以 GET /ops/delivery/incident?tenant_id=...&delivery_key=...&segment_no=... 查询原分段，核对回执和 Ledger version。成功回执与路由不匹配时查原配置/格式，不手改摘要；已存成功回执禁止 retry_not_delivered/not_delivered。确有外部证据后，POST resolve 使用原 expected_version、原证据引用和明确决定；完全相同请求重试为幂等成功，不同证据冲突返回 409。HTTP actor 的 deployment-admin 前缀来自鉴权，后缀只是管理员填写的标签，不证明独立人类身份。
+
+GET 详情返回的是观察结果，期间可能发生自动核对，提交仍可能 409；刷新原事件后裁决，不能绕过 CAS。sent 只跳过发送，failed 不自动跳到下一段；delivered 人工确认可重新调度原 Outbox，已确认段跳过后继续剩余段。receipt 缺失、核对耗尽和 operator_confirmed_not_delivered 都不能写成客户端已经看见答案。
+
+测试设施新增 p4-receipt 暂停点：ProviderReceipt 已持久化但 Ledger 尚未 sent。原 p4 仍是渠道成功响应后、journal 前，两者不可互相替代；真实渠道演练结论仍独立记录。
+
 ## 工具状态查询的发布和排障
 
-本轮无新增表，仍需 000007。local_note 的 policy/key 保持原值，PG Writer 新增认证查询与同键结果读取；旧密钥版本必须保留，否则不得把查询/幂等 Create 的解密错误当作成功。MCP 启用 Lookup 或 JSONTextResult 会改变绑定摘要，须按不可变版本发布工具及 Agent revision；默认不启用者保持原输出/摘要。
+工具查询优先本身未新增表；当前部署需执行至 000008。local_note 的 policy/key 保持原值，PG Writer 新增认证查询与同键结果读取；旧密钥版本必须保留，否则不得把查询/幂等 Create 的解密错误当作成功。MCP 启用 Lookup 或 JSONTextResult 会改变绑定摘要，须按不可变版本发布工具及 Agent revision；默认不启用者保持原输出/摘要。
 
 recovery_pending/recovery_unknown/recovery_lookup_error 表示原操作待确认，禁止手工换业务键或删工具行来触发新写。external_operation_failed/tool_receipt_rejected 是失败而非“无副作用”；按原业务键查业务事实和凭证。pending 仍受任务预算约束，耗尽后的安全停止不代表操作回滚。只有实际供应商满足配置的幂等与只读查询契约，才能使用 MCP 查询优先；仅把某工具命名为 lookup 不构成只读保证。
 
 ## 完成候选版本与恢复矛盾处置
 
-本轮未新增迁移，数据库仍需 000007。新候选 JSON 写 SchemaVersion=2/PlanDigest，能读取旧 SchemaVersion=1；只认识版本 1 的旧 Worker 不能处理新候选，未清空在途记录前不要回滚旧应用或混跑为兼容方案。自定义 AtomicSessionStore 还要实现 TerminalHistoryReader；缺少接口时 Worker 在启动新模型运行前拒绝降级。
+完成候选版本 2 沿用原表；当前数据库需执行至 000008。新候选 JSON 写 SchemaVersion=2/PlanDigest，能读取旧 SchemaVersion=1；只认识版本 1 的旧 Worker 不能处理新候选，未清空在途记录前不要回滚旧应用或混跑为兼容方案。自定义 AtomicSessionStore 还要实现 TerminalHistoryReader；缺少接口时 Worker 在启动新模型运行前拒绝降级。
 
 | 原因码 | 查询与处置 |
 |---|---|
@@ -23,7 +33,7 @@ recovery_pending/recovery_unknown/recovery_lookup_error 表示原操作待确认
 
 ## 步骤级恢复升级与排障
 
-先依次执行至 `000007_execution_completion` 再运行当前应用。旧实例不理解合同版本、失败阶段与完成候选，不能在仍有未完成任务时混用或无条件回滚旧应用。保留计划/检查点/完成候选、旧 payload key version 和原工具结果；000006 的 down 不删除失败记录，有 failed 记录时回退旧阶段约束会失败并整体回滚。000007 的 down 会删除候选表，不能在待恢复候选仍存在时执行；须先完成/处置原请求并保留备份与密钥。
+先依次执行至 `000008_delivery_receipt` 再运行当前应用。旧实例不理解合同版本、失败阶段与完成候选，不能在仍有未完成任务时混用或无条件回滚旧应用。保留计划/检查点/完成候选、旧 payload key version 和原工具结果；000006 的 down 不删除失败记录，有 failed 记录时回退旧阶段约束会失败并整体回滚。000007 的 down 会删除候选表，不能在待恢复候选仍存在时执行；须先完成/处置原请求并保留备份与密钥。
 
 候选存在但无 result_payload 时，核对 envelope/content 摘要、key_version、预约与 output 决策；让 Worker 沿原 request 自动续提交，不手动 Reserve 新预约、删候选或把私有候选直接作为回复。MCP 新恢复契约和 code_exec CompletionContract=1 改变绑定摘要，需发布新工具版本及 Agent revision，不能修改旧版本摘要。历史读取过滤保留原始 SDK 事件，排障应同时比较原始记录和本轮模型输入视图。
 
@@ -167,7 +177,7 @@ Worker、Delivery 和 Wakeup 的读取 context 先取消，活动工作 context 
 
 发布前运行相应代码回归，部署前约定故障窗口和证据计划；强杀/重新加入/反向故障、双Bot原会话与P1–P4分别记录结论。真实验收未做时标注未验证；assumed只作为本轮明确前提，不转写成测得成功。
 
-内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。P4 中若匹配的 provider receipt 已落库，可直接补齐 Ledger；回执也未落库的剩余窗口仍需下游可靠去重/查询或外部处置证据。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
 
 ## 按原request定位积压，而不是重新造任务
 

@@ -2,6 +2,8 @@
 
 本文是阅读摘要，详细机制、字段、代码及验收分别在同目录L1–L4文档中展开，所有正文使用同一当前实现口径。
 
+当前部署增加 000008_delivery_receipt：正常成功响应先保存不可变发送回执，再确认 Ledger；回执落库后退出可由新 owner 核对计划/路由/分段摘要自动补 sent，不重发。没有持久证据的窗口仍按真实渠道查询或人工证据处置；未知错误、取消、续租失败、HTTP 服务端错误不再盲重试，failed 分段阻断后续分段。新增 GET /ops/delivery/incident，resolve 支持原请求幂等重试，且不能用负向处置覆盖已存成功回执。
+
 `000007_execution_completion` 将输出审核与治理写入分开：完整 envelope、输入摘要、原预约、分模型用量、确定的结算参数、输出审核决定与最终渲染内容先加密保存。候选不可改写且不是可投递结果；接管者跳过新的模型运行，重放原结算决定，再保存 result_payload 和 terminal/Outbox。即使预约已 settled，也不重新 Begin 而误判为 reservation_closed。读取顺序是先核对完成候选及其关联公开结果，再兼容无候选的旧冻结结果，最后才考虑新模型运行。新候选 SchemaVersion=2 额外绑定 PlanDigest，矛盾状态提交明确 failed/audit 并保留证据，不盲目重算或发送。SQL 候选写入还与 execution_attempt 的执行记录锁串行，拒绝已被新 Fence 超越的写入。
 
 MCP 恢复默认 manual；经代码审核的 ReadOnly 才允许重放，经审核的 IdempotencyParameter 配合 CompletionCheck 才开启同业务键重试。参数由可信 tenant/request/工具/稳定调用/参数摘要派生并注入，模型不能覆盖。每次连接重新核对声明摘要，MCP isError 不成为成功证据。代码执行提供 status=completed 可信断言，非零退出、超时及 SDK 参数校验不算完成；执行中断仍采用 manual，因为不能从所有沙箱后端推断外部写操作幂等。
@@ -20,7 +22,8 @@ MCP 恢复默认 manual；经代码审核的 ReadOnly 才允许重放，经审�
 | result-before-commit | 冻结结果保存后、terminal/Outbox 提交前 | 原 result_ref/digest 不变，接管不再调用模型。 |
 | p3 | terminal 已提交、reply PublishReply 前 | session_commit、result_payload、已领取 reply Outbox。 |
 | p4-before-send | Ledger claim 后、provider 调用前 | 旧发送前边界，不能证明 P4 已接受。 |
-| p4 | provider 成功接受且返回消息 ID 后、Ledger sent 前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4 | provider 成功接受且返回消息 ID 后、回执落库前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4-receipt | delivery_receipt 已落库、Ledger sent 前 | 接管后核对摘要，只补 sent，不再次调用渠道。 |
 | tool-effect | 工具业务效果完成后、工具结果提交前 | 按业务键查外部效果，恢复不能增加效果数。 |
 
 仅 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 注册 `/test/failover/<point>/arm|status|release`，用本地 WebUI token 鉴权。arm 可带 tenant_id/request_id 过滤；status 回显命中身份/evidence。暂停控制面是进程内测试设施，不续 lease、不修改业务状态、不替系统重投。标准接管在命中后杀 owner，不对 survivor release。
@@ -50,7 +53,7 @@ MCP 恢复默认 manual；经代码审核的 ReadOnly 才允许重放，经审�
 | 工具尝试 / 业务效果 | `tool_execution.attempt` / 外部业务幂等记录 | 同键工具重试可大于一次，业务效果应按工具契约去重。 |
 | 回复发送 / 用户可见答案 | Ledger `attempt`、`segment_no/count` / 客户端证据 | 一条答案可有多个分段；唯一 Ledger 行不能单独证明用户只见一次。 |
 
-内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。P4 中若匹配的 provider receipt 已落库，可直接补齐 Ledger；回执也未落库的剩余窗口仍需下游可靠去重/查询或外部处置证据。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
 
 ## 详细文档
 

@@ -1253,3 +1253,61 @@ RETURNING outbox_id`, in.TenantID, in.DeliveryKey).Scan(&outboxID)
 工具Complete之前失败，依靠工具恢复策略；Complete后镜像失败，复用主结果；最终PutResult后terminal失败，复用冻结答案；provider接受后Ledger失败，进入P4核对。它们不能由一个“重试整个函数”策略覆盖。
 
 代码中的错误返回也有不同含义：ErrVersionConflict可能是并发推进，ErrLeaseLost表示已无执行资格，ErrEffectUnknown表示外部效果无法安全确定，TerminalError表示发送失败已durable可确认队列。读代码时应同时看调用方如何处理，而不是把非nil都当成同一种重试。
+
+## P4 持久回执的数据库证据
+
+来源：`trpcservice/storage/messaging/postgres/receipt.go`，完整文件。插入与 Ledger 行锁在同一 SQL 中，过期执行权不能追加证据；冲突只可核对原值，不能覆盖旧回执。回执通过 tenant/key/segment 关联且校验计划、路由和实际发送字节；恢复算法见参考实现的 Service 完整源码。
+
+```go
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+)
+
+func (s *Store) PutProviderReceipt(ctx context.Context, owner messaging.DeliveryRecord, r messaging.ProviderReceipt) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if owner.DeliveryKey != r.DeliveryKey || owner.ClientRequestID != r.ClientRequestID || r.PlanDigest != messaging.ReceiptDigest(owner.Plan) || owner.ClaimOwner == "" {
+		return runtime.ErrVersionMismatch
+	}
+	var stored messaging.ProviderReceipt
+	stored.DeliveryKey = r.DeliveryKey
+	err := s.db.QueryRowContext(ctx, `INSERT INTO delivery_receipt(tenant_id,delivery_key,segment_no,client_request_id,provider_message_id,plan_digest,route_digest,segment_digest)
+SELECT $1,$2,$3,$4,$5,$6,$7,$10 FROM delivery_ledger
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND state='sending' AND client_request_id=$4
+AND version=$8 AND claim_owner=$9 AND claim_until>now() FOR UPDATE
+ON CONFLICT(tenant_id,delivery_key,segment_no) DO UPDATE SET delivery_key=EXCLUDED.delivery_key
+RETURNING client_request_id,provider_message_id,plan_digest,route_digest,segment_digest`, r.TenantID, r.DeliveryKey.DeliveryKey, r.SegmentNo, r.ClientRequestID, r.ProviderMessageID, r.PlanDigest, r.RouteDigest, owner.Version, owner.ClaimOwner, r.SegmentDigest).Scan(&stored.ClientRequestID, &stored.ProviderMessageID, &stored.PlanDigest, &stored.RouteDigest, &stored.SegmentDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runtime.ErrLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if stored.ClientRequestID != r.ClientRequestID || stored.ProviderMessageID != r.ProviderMessageID || stored.PlanDigest != r.PlanDigest || stored.RouteDigest != r.RouteDigest || stored.SegmentDigest != r.SegmentDigest {
+		return runtime.ErrIdempotencyCollision
+	}
+	return nil
+}
+func (s *Store) GetProviderReceipt(ctx context.Context, k messaging.DeliveryKey) (messaging.ProviderReceipt, error) {
+	r := messaging.ProviderReceipt{DeliveryKey: k}
+	if k.TenantID == "" || k.DeliveryKey == "" || k.SegmentNo < 0 {
+		return r, runtime.ErrTenantScope
+	}
+	err := s.db.QueryRowContext(ctx, `SELECT client_request_id,provider_message_id,plan_digest,route_digest,segment_digest,created_at FROM delivery_receipt WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3`, k.TenantID, k.DeliveryKey, k.SegmentNo).Scan(&r.ClientRequestID, &r.ProviderMessageID, &r.PlanDigest, &r.RouteDigest, &r.SegmentDigest, &r.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r, runtime.ErrNotFound
+	}
+	if err != nil {
+		return r, err
+	}
+	return r, r.Validate()
+}
+```

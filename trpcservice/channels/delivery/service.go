@@ -53,6 +53,7 @@ func (e TerminalError) Unwrap() error { return e.Err }
 type Service struct {
 	Results              messaging.ResultStore
 	Ledger               messaging.DeliveryLedger
+	Receipts             messaging.ProviderReceiptStore
 	Adapters             AdapterResolver
 	Owner                string
 	ClaimTTL             time.Duration
@@ -116,10 +117,21 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 	}
 	if !acquired {
 		switch record.State {
-		case messaging.DeliverySent, messaging.DeliveryFailed:
+		case messaging.DeliverySent:
+			if receipts := s.receiptStore(); receipts != nil {
+				r, readErr := receipts.GetProviderReceipt(ctx, key)
+				if readErr == nil && !receiptMatches(r, record, event, contentFingerprint(content)) {
+					return runtime.ErrVersionMismatch
+				}
+				if readErr != nil && !errors.Is(readErr, runtime.ErrNotFound) {
+					return readErr
+				}
+			}
 			return nil
+		case messaging.DeliveryFailed:
+			return TerminalError{Err: errors.New("delivery segment is terminally failed")}
 		case messaging.DeliveryAmbiguous:
-			return s.reconcile(ctx, event, record)
+			return s.reconcile(ctx, event, record, contentFingerprint(content))
 		case messaging.DeliveryPending, messaging.DeliverySending, messaging.DeliveryRetryWait:
 			return DeferredError{NotBefore: record.NotBefore}
 		default:
@@ -131,16 +143,15 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 			return err
 		}
 	}
-	contentDigest := plan.ContentDigest
-	if plan.SegmentCount > 1 {
-		sum := sha256.Sum256(content)
-		contentDigest = hex.EncodeToString(sum[:])
-	}
+	contentDigest := segmentDigest(plan, content)
 	record, resultDelivery, deliverErr := s.deliverWithClaimRenewal(ctx, adapter, channel.DeliveryRequest{
 		Event: event, ClientRequestID: record.ClientRequestID, Target: event.Target,
 		Content: append([]byte(nil), content...), ContentDigest: contentDigest, ContentType: contentType,
 	}, record, claimTTL)
 	if deliverErr != nil {
+		if resultDelivery.Delivered || resultDelivery.ProviderMessageID != "" {
+			deliverErr = AmbiguousError{Err: deliverErr}
+		}
 		var ambiguous AmbiguousError
 		if errors.As(deliverErr, &ambiguous) {
 			record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "response_lost"
@@ -155,15 +166,26 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 		if errors.As(deliverErr, &retryAfter) {
 			return s.finishRetry(ctx, record, deliverErr, retryAfter.RetryAfter)
 		}
-		return s.finishRetry(ctx, record, deliverErr, 0)
+		return s.finishAmbiguous(ctx, record, deliverErr, "unclassified_send_error")
 	}
 	if !resultDelivery.Delivered {
-		return s.finishRetry(ctx, record, runtime.ErrBackendUnavailable, 0)
+		return s.finishAmbiguous(ctx, record, runtime.ErrBackendUnavailable, "missing_delivery_outcome")
 	}
 	if resultDelivery.ProviderMessageID == "" {
 		record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "missing_provider_message_id"
 		_, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
 		return errors.Join(AmbiguousError{Err: runtime.ErrInvariantViolation}, finishErr)
+	}
+	if receipts := s.receiptStore(); receipts != nil {
+		r := messaging.ProviderReceipt{DeliveryKey: record.DeliveryKey, ClientRequestID: record.ClientRequestID, ProviderMessageID: resultDelivery.ProviderMessageID, PlanDigest: messaging.ReceiptDigest(record.Plan), RouteDigest: receiptRouteDigest(event), SegmentDigest: contentFingerprint(content)}
+		if err = receipts.PutProviderReceipt(ctx, record, r); err != nil {
+			return s.finishAmbiguous(ctx, record, err, "receipt_persist_failed")
+		}
+		if s.Barrier != nil {
+			if err = s.Barrier.Wait(ctx, inflight.PointP4ReceiptPersisted); err != nil {
+				return err
+			}
+		}
 	}
 	record.State = messaging.DeliverySent
 	record.ProviderMessageID = resultDelivery.ProviderMessageID
@@ -231,9 +253,23 @@ func splitText(content []byte, maxBytes int) [][]byte {
 	return segments
 }
 
-func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record messaging.DeliveryRecord) error {
+func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record messaging.DeliveryRecord, contentDigest string) error {
 	if record.NotBefore.After(time.Now()) {
 		return DeferredError{NotBefore: record.NotBefore}
+	}
+	if receipts := s.receiptStore(); receipts != nil {
+		r, err := receipts.GetProviderReceipt(ctx, record.DeliveryKey)
+		if err == nil {
+			if !receiptMatches(r, record, event, contentDigest) {
+				return s.deferReconciliation(ctx, record, runtime.ErrVersionMismatch)
+			}
+			record.State, record.ProviderMessageID, record.LastErrorClass = messaging.DeliverySent, r.ProviderMessageID, "provider_receipt_recovered"
+			_, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version)
+			return err
+		}
+		if !errors.Is(err, runtime.ErrNotFound) {
+			return s.deferReconciliation(ctx, record, err)
+		}
 	}
 	adapter, err := s.resolveAdapter(ctx, event)
 	if err != nil {
@@ -243,7 +279,7 @@ func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record
 	if !ok {
 		return s.deferReconciliation(ctx, record, runtime.ErrCapabilityUnsupported)
 	}
-	result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: record.ClientRequestID})
+	result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: record.ClientRequestID, ContentDigest: contentDigest})
 	if err != nil {
 		return s.deferReconciliation(ctx, record, err)
 	}
@@ -339,12 +375,45 @@ func (s Service) deliverWithClaimRenewal(ctx context.Context, adapter channel.Ad
 	renewal := <-done
 	if renewal.err != nil {
 		err := errors.Join(deliverErr, renewal.err)
-		if result.Delivered {
-			err = AmbiguousError{Err: err}
-		}
+		err = AmbiguousError{Err: err}
 		return renewal.record, result, err
 	}
 	return renewal.record, result, deliverErr
+}
+
+func (s Service) receiptStore() messaging.ProviderReceiptStore {
+	if s.Receipts != nil {
+		return s.Receipts
+	}
+	r, _ := s.Ledger.(messaging.ProviderReceiptStore)
+	return r
+}
+func segmentDigest(plan messaging.DeliveryPlan, content []byte) string {
+	if plan.SegmentCount == 1 {
+		return plan.ContentDigest
+	}
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
+func contentFingerprint(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }
+func receiptMatches(r messaging.ProviderReceipt, record messaging.DeliveryRecord, event channel.ReplyEvent, digest string) bool {
+	return r.Validate() == nil && r.DeliveryKey == record.DeliveryKey && r.ClientRequestID == record.ClientRequestID && r.PlanDigest == messaging.ReceiptDigest(record.Plan) && r.RouteDigest == receiptRouteDigest(event) && r.SegmentDigest == digest
+}
+func receiptRouteDigest(e channel.ReplyEvent) string {
+	return messaging.ReceiptDigest(struct {
+		TenantID, RequestID, BindingID, ContentRef string
+		ConfigVersion                              int64
+		Target                                     channel.DeliveryTarget
+		EventSeq                                   uint64
+		Kind, ContentType                          string
+		Final                                      bool
+	}{e.TenantID, e.RequestID, e.ChannelBindingID, e.ContentRef, e.ConfigVersion, e.Target, e.EventSeq, e.Kind, e.ContentType, e.Final})
+}
+func (s Service) finishAmbiguous(ctx context.Context, r messaging.DeliveryRecord, cause error, class string) error {
+	r.State, r.LastErrorClass = messaging.DeliveryAmbiguous, class
+	_, err := s.Ledger.FinishDelivery(ctx, r, r.Version)
+	return errors.Join(AmbiguousError{Err: cause}, err)
 }
 
 func (s Service) deferReconciliation(ctx context.Context, record messaging.DeliveryRecord, cause error) error {

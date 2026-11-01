@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"database/sql"
@@ -8,10 +9,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/coordination"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 	messagingpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging/postgres"
 )
 
@@ -73,6 +77,7 @@ func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, sto
 'preprocess_claims',(SELECT coalesce(jsonb_agg(q),'[]') FROM (SELECT request_id,session_id,lease_owner,lease_until,attempt,version FROM preprocess_job WHERE tenant_id=$1 AND lease_owner IS NOT NULL ORDER BY lease_until LIMIT 100) q),
 'outbox',(SELECT coalesce(jsonb_object_agg(kind||':'||state,n),'{}') FROM (SELECT kind,state,count(*) n FROM outbox WHERE tenant_id=$1 GROUP BY kind,state) q),
 'deliveries',(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM delivery_ledger WHERE tenant_id=$1 GROUP BY state) q),
+'delivery_receipts',(SELECT count(*) FROM delivery_receipt WHERE tenant_id=$1),
 'delivery_incidents',(SELECT coalesce(jsonb_agg(q),'[]') FROM (SELECT delivery_key,segment_no,state,version,attempt,reconcile_attempt,last_error_class,claim_owner,claim_until,updated_at FROM delivery_ledger WHERE tenant_id=$1 AND (state='ambiguous' OR (state='failed' AND last_error_class='reconcile_exhausted')) ORDER BY updated_at,delivery_key,segment_no LIMIT 100) q),
 'outbox_claims',(SELECT coalesce(jsonb_agg(q),'[]') FROM (SELECT kind,aggregate_id,claim_owner,claim_until,version FROM outbox WHERE tenant_id=$1 AND state='claimed' ORDER BY claim_until LIMIT 100) q),
 'tool_executions',(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM tool_execution WHERE tenant_id=$1 GROUP BY state) q),
@@ -89,7 +94,17 @@ func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, sto
 		if !authorize(w, r) {
 			return
 		}
-		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10))
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<10))
+		if err != nil {
+			http.Error(w, "invalid resolution", 400)
+			return
+		}
+		canonical, _, err := governance.CanonicalArguments(raw)
+		if err != nil {
+			http.Error(w, "invalid resolution", 400)
+			return
+		}
+		decoder := json.NewDecoder(bytes.NewReader(canonical))
 		decoder.DisallowUnknownFields()
 		var in messagingpostgres.DeliveryResolution
 		if err := decoder.Decode(&in); err != nil {
@@ -100,10 +115,17 @@ func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, sto
 			http.Error(w, "invalid resolution", 400)
 			return
 		}
+		// The token authenticates the deployment administrator, not a human
+		// named by the JSON body. Retain that name only as an operator label.
+		in.Actor = "deployment-admin/" + in.Actor
+		if in.Validate() != nil {
+			http.Error(w, "invalid operator label", 400)
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
-		err := store.ResolveUncertainDelivery(ctx, in)
-		if errors.Is(err, runtime.ErrVersionConflict) {
+		err = store.ResolveUncertainDelivery(ctx, in)
+		if errors.Is(err, runtime.ErrVersionConflict) || errors.Is(err, runtime.ErrIdempotencyCollision) {
 			http.Error(w, "delivery changed or not uncertain", 409)
 			return
 		}
@@ -112,5 +134,29 @@ func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, sto
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /ops/delivery/incident", func(w http.ResponseWriter, r *http.Request) {
+		if !authorize(w, r) {
+			return
+		}
+		q := r.URL.Query()
+		segment, err := strconv.Atoi(q.Get("segment_no"))
+		if err != nil || segment < 0 || segment > 1<<31-1 || q.Get("tenant_id") == "" || len(q.Get("tenant_id")) > 256 || q.Get("delivery_key") == "" || len(q.Get("delivery_key")) > 1024 {
+			http.Error(w, "tenant_id, delivery_key and valid segment_no required", 400)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		incident, err := store.GetDeliveryIncident(ctx, messaging.DeliveryKey{TenantID: q.Get("tenant_id"), DeliveryKey: q.Get("delivery_key"), SegmentNo: segment})
+		if errors.Is(err, runtime.ErrNotFound) {
+			http.Error(w, "delivery not found", 404)
+			return
+		}
+		if err != nil {
+			http.Error(w, "incident unavailable", 503)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(incident)
 	})
 }

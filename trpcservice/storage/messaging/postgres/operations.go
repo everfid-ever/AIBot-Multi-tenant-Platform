@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"unicode"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 )
@@ -24,7 +25,12 @@ type DeliveryResolution struct {
 }
 
 func (in DeliveryResolution) Validate() error {
-	if strings.TrimSpace(in.TenantID) == "" || strings.TrimSpace(in.DeliveryKey) == "" || in.SegmentNo < 0 || in.ExpectedVersion < 1 ||
+	for _, v := range []string{in.TenantID, in.DeliveryKey, in.Actor, in.EvidenceRef, in.ProviderMessageID} {
+		if strings.IndexFunc(v, unicode.IsControl) >= 0 {
+			return runtime.ErrInvalidEnvelope
+		}
+	}
+	if strings.TrimSpace(in.TenantID) == "" || len(in.TenantID) > 256 || strings.TrimSpace(in.DeliveryKey) == "" || len(in.DeliveryKey) > 1024 || in.SegmentNo < 0 || in.SegmentNo > 1<<31-1 || in.ExpectedVersion < 1 ||
 		strings.TrimSpace(in.Actor) == "" || len(in.Actor) > 256 || strings.TrimSpace(in.EvidenceRef) == "" || len(in.EvidenceRef) > 1024 {
 		return runtime.ErrInvalidEnvelope
 	}
@@ -59,9 +65,23 @@ func (s *Store) ResolveUncertainDelivery(ctx context.Context, in DeliveryResolut
 SET state=$5,provider_message_id=NULLIF($6,''),last_error_class=$7,not_before=now(),version=version+1,updated_at=now()
 WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$4
 AND (state='ambiguous' OR (state='failed' AND last_error_class='reconcile_exhausted'))
+AND NOT EXISTS (SELECT 1 FROM delivery_receipt r WHERE r.tenant_id=$1 AND r.delivery_key=$2 AND r.segment_no=$3
+AND ($5<>'sent' OR r.provider_message_id IS DISTINCT FROM NULLIF($6,'')))
 RETURNING version`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion, state, in.ProviderMessageID, class).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
-		return runtime.ErrVersionConflict
+		var prior DeliveryResolution
+		err = tx.QueryRowContext(ctx, `SELECT actor,evidence_ref,decision,COALESCE(provider_message_id,'') FROM delivery_resolution
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND expected_version=$4`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion).Scan(&prior.Actor, &prior.EvidenceRef, &prior.Decision, &prior.ProviderMessageID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtime.ErrVersionConflict
+		}
+		if err != nil {
+			return err
+		}
+		if prior.Actor != in.Actor || prior.EvidenceRef != in.EvidenceRef || prior.Decision != in.Decision || prior.ProviderMessageID != in.ProviderMessageID {
+			return runtime.ErrIdempotencyCollision
+		}
+		return tx.Commit()
 	}
 	if err != nil {
 		return err

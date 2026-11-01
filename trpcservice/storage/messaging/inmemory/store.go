@@ -13,6 +13,7 @@ import (
 )
 
 type Store struct {
+	receipts     map[messaging.DeliveryKey]messaging.ProviderReceipt
 	mu           sync.Mutex
 	inbox        map[messaging.InboxKey]messaging.InboxRecord
 	deliveries   map[messaging.DeliveryKey]messaging.DeliveryRecord

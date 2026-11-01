@@ -1,5 +1,21 @@
 # 在途任务接管与幂等投递 — 测试与验收
 
+## P4 回执和受控处置代码回归
+
+| 用例 | 代码入口 | 判据 |
+|---|---|---|
+| journal 后、Ledger 前故障 | channels/delivery/receipt_test.go | 新 owner 直接补 sent，无渠道查询、无再次 send，发送 attempt 保持 1。 |
+| 回执写入失败、未知错误、结果矛盾、无结果、续租丢失 | 同上 | ambiguous，不进入 retry_wait 或补发。 |
+| 路由变化、分段数相同但边界字节变化 | 同上 | 原回执不能被用于确认新目的地/新字节，不能再发送。 |
+| failed 段被重放 | 同上 | TerminalError，后续段不发送。 |
+| 回执写入旧 owner/篡改 | messaging/{postgres,inmemory}/receipt_test.go | owner/version/有效租期验证；原 provider ID 和摘要不覆盖，租户隔离。 |
+| WebUI 错账号、用户、会话、绑定、版本、结果或摘要 | channels/webui/adapter_test.go | 只能返回 unknown，不能确认别的请求效果。 |
+| 企业微信发出请求后取消、飞书 503 | 对应 adapter_test.go | ambiguous；限流明确拒绝仍允许受控重试。 |
+| resolve 响应重试、不同证据、存储失败 | messaging/postgres/operations_test.go | 完全相同请求幂等成功，不同证据冲突；审计/重调度失败回滚。 |
+| 事件详情和管理员 actor | cmd/trpc-service/runtime_operations_test.go、messaging/postgres/incident_test.go | 显式租户/分段、鉴权、无正文秘密、服务器管理员命名空间；拒绝重复 JSON 键。 |
+
+新 p4-receipt 与原 p4 分开：前者已有 durable receipt，后者还没有；不能用前者通过证明后者自动恢复。SQL mock 校验调用与资格条件，不等于真实 PG 锁竞态或渠道客户端可见性已验收；真实执行结果仍保存在独立运行目录。
+
 ## 工具查询优先与业务效果计数回归
 
 | 回归 | 代码证据 | 判据 |
@@ -117,7 +133,8 @@ t0 为外部确认故障时刻；t_ready 为观察到执行链路就绪；新消
 | result-before-commit | 冻结结果保存后、terminal/Outbox 提交前 | 原 result_ref/digest 不变，接管不再调用模型。 |
 | p3 | terminal 已提交、reply PublishReply 前 | session_commit、result_payload、已领取 reply Outbox。 |
 | p4-before-send | Ledger claim 后、provider 调用前 | 旧发送前边界，不能证明 P4 已接受。 |
-| p4 | provider 成功接受且返回消息 ID 后、Ledger sent 前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4 | provider 成功接受且返回消息 ID 后、回执落库前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4-receipt | delivery_receipt 已落库、Ledger sent 前 | 接管后核对摘要，只补 sent，不再次调用渠道。 |
 | tool-effect | 工具业务效果完成后、工具结果提交前 | 按业务键查外部效果，恢复不能增加效果数。 |
 
 仅 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 注册 `/test/failover/<point>/arm|status|release`，用本地 WebUI token 鉴权。arm 可带 tenant_id/request_id 过滤；status 回显命中身份/evidence。暂停控制面是进程内测试设施，不续 lease、不修改业务状态、不替系统重投。标准接管在命中后杀 owner，不对 survivor release。
@@ -173,7 +190,7 @@ t0 为外部确认故障时刻；t_ready 为观察到执行链路就绪；新消
 
 服务端 Ledger 一行 sent 只能证明本地终态；客户端可见重复必须直接核对。模型调用多次不直接失败，正确性看同一原请求提交、业务效果和交付边界。
 
-内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。P4 中若匹配的 provider receipt 已落库，可直接补齐 Ledger；回执也未落库的剩余窗口仍需下游可靠去重/查询或外部处置证据。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
 
 ## 脚本与回归
 

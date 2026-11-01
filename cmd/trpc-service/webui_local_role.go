@@ -771,7 +771,7 @@ func registerWebUILocalFailoverTestEndpoints(mux *http.ServeMux, token string, b
 		writeSnapshot(writer, action())
 	}
 	for name, point := range map[string]inflight.Point{"p1": inflight.PointP1BeforeExecution, "p2": inflight.PointP2DuringModelResponse, "p3": inflight.PointP3BeforeReplyPublish, "p4": inflight.PointP4AfterProviderAccepted,
-		"p2-commit": inflight.PointP2BeforeTerminalCommit, "p4-before-send": inflight.PointP4BeforeProviderDelivery, "tool-effect": inflight.PointToolEffectBeforeCommit,
+		"p2-commit": inflight.PointP2BeforeTerminalCommit, "p4-before-send": inflight.PointP4BeforeProviderDelivery, "p4-receipt": inflight.PointP4ReceiptPersisted, "tool-effect": inflight.PointToolEffectBeforeCommit,
 		"result-before-commit": inflight.PointResultPersistedBeforeCommit} {
 		point := point
 		prefix := "/test/failover/" + name

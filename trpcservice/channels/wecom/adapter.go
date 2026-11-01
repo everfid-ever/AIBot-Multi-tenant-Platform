@@ -113,11 +113,11 @@ func (a *Adapter) Deliver(ctx context.Context, request channel.DeliveryRequest) 
 	if a.Sender == nil || request.Event.TenantID == "" || request.Event.ChannelBindingID == "" ||
 		request.Target.Channel != "wecom" || request.Target.ExternalAccountID == "" || request.Target.ExternalUserID == "" ||
 		len(request.Content) == 0 || request.ClientRequestID == "" {
-		return channel.DeliveryResult{}, runtime.ErrInvariantViolation
+		return channel.DeliveryResult{}, channel.PermanentDeliveryError{Err: runtime.ErrInvariantViolation, Class: "invalid_delivery"}
 	}
 	sum := sha256.Sum256(request.Content)
 	if request.ContentDigest != hex.EncodeToString(sum[:]) {
-		return channel.DeliveryResult{}, runtime.ErrVersionMismatch
+		return channel.DeliveryResult{}, channel.PermanentDeliveryError{Err: runtime.ErrVersionMismatch, Class: "content_digest_mismatch"}
 	}
 	destination := channel.ReplyDestination{TenantID: request.Event.TenantID, Channel: request.Target.Channel,
 		ChannelBindingID: request.Event.ChannelBindingID, ExternalAccountID: request.Target.ExternalAccountID,
@@ -181,7 +181,7 @@ func (s OfficialSender) SendText(ctx context.Context, destination channel.ReplyD
 	for attempt := 0; attempt < 2; attempt++ {
 		token, agentID, err := s.Tokens.ResolveWeComAccessToken(ctx, destination, attempt == 1)
 		if err != nil {
-			return "", err
+			return "", channel.RetryableDeliveryError{Err: err}
 		}
 		if token == "" || agentID <= 0 {
 			return "", runtime.ErrVersionMismatch
@@ -203,7 +203,7 @@ func (s OfficialSender) SendImage(ctx context.Context, destination channel.Reply
 	for attempt := 0; attempt < 2; attempt++ {
 		token, agentID, err := s.Tokens.ResolveWeComAccessToken(ctx, destination, attempt == 1)
 		if err != nil {
-			return "", err
+			return "", channel.RetryableDeliveryError{Err: err}
 		}
 		mediaID, invalidToken, err := s.uploadImage(ctx, token, image, contentType)
 		if invalidToken && attempt == 0 {
@@ -323,14 +323,14 @@ func (s OfficialSender) send(ctx context.Context, token string, agentID int64, e
 	response, err := client.Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", false, ctx.Err()
+			return "", false, channel.AmbiguousDeliveryError{Err: ctx.Err()}
 		}
 		// A net/http url.Error includes the full URL, including access_token.
 		// Preserve the ambiguous classification without allowing that secret to
 		// escape through logs or a Delivery Ledger error string.
 		return "", false, channel.AmbiguousDeliveryError{Err: runtime.ErrBackendUnavailable}
 	}
-	if response == nil {
+	if response == nil || response.Body == nil {
 		return "", false, channel.AmbiguousDeliveryError{Err: runtime.ErrBackendUnavailable}
 	}
 	defer response.Body.Close()
@@ -371,7 +371,9 @@ func (s OfficialSender) send(ctx context.Context, token string, agentID int64, e
 	switch result.ErrorCode {
 	case 40014, 42001, 42007:
 		return "", true, channel.RetryableDeliveryError{Err: err}
-	case -1, 45002, 45009, 45011:
+	case -1:
+		return "", false, channel.AmbiguousDeliveryError{Err: err}
+	case 45002, 45009, 45011:
 		return "", false, channel.RetryableDeliveryError{Err: err}
 	default:
 		return "", false, channel.PermanentDeliveryError{Err: err, Class: "provider_rejected"}

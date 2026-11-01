@@ -1,8 +1,8 @@
 # 在途任务接管与幂等投递 — 参考实现
 
-## 步骤检查点、失败收敛与完成候选增量契约（000005–000007）
+## 步骤检查点、失败收敛与完成候选与投递回执增量契约（000005–000008）
 
-在本文原有 000001–000004 基础上依次应用 `000005_task_checkpoints`、`000006_task_failure_convergence`、`000007_execution_completion`。新表、合同、计数和数据库写入保护见 [design.md](design.md)；实现入口还包括 `trpcservice/worker/completion.go`、`storage/messaging/postgres/completion.go` 与 `governance/service.go`。
+在本文原有 000001–000004 基础上依次应用 `000005_task_checkpoints`、`000006_task_failure_convergence`、`000007_execution_completion`、`000008_delivery_receipt`。新表、合同、计数和数据库写入保护见 [design.md](design.md)；实现入口还包括 `trpcservice/worker/completion.go`、`storage/messaging/postgres/completion.go` 与 `governance/service.go`。
 
 000007 的完整新增 DDL 如下，字段表及加密/资格条件见 design。候选上限为加密前 2 MiB；同 tenant/request 不可变。GetCompletion 必须按 tenant/request 取密文、按原 key_version 解析租户密钥、AAD 验证解密、核对正文 SHA-256；认证失败不返回可继续生成的新任务。PutCompletion 必须在 execution_record 行锁内比较 execution_attempt 的已登记最大 Fence，然后按原输入顺序插入或核对完全相同候选。
 
@@ -25,7 +25,7 @@ MCP Config 的 ReadOnly、IdempotencyParameter、CompletionCheck 继续保留；
 
 ### 工具查询优先的复刻契约
 
-本轮没有额外数据库迁移。RecoveryLookup 是原 idempotent_key 之上的可选读协议，不更改已保存的 policy/key；tenant 门面须同时转发 RecoveryLookupEnabled 与 LookupRecovery，不能因包装器自身有方法就假定底层支持。Guard 仅在 Attempt>1 或确认已消费后的恢复路径调用它；成功旧结果的复用不重新调用供应商。
+工具状态查询沿用原表，当前部署须执行至 000008。RecoveryLookup 是原 idempotent_key 之上的可选读协议，不更改已保存的 policy/key；tenant 门面须同时转发 RecoveryLookupEnabled 与 LookupRecovery，不能因包装器自身有方法就假定底层支持。Guard 仅在 Attempt>1 或确认已消费后的恢复路径调用它；成功旧结果的复用不重新调用供应商。
 
 | LookupConfig 字段 | 类型 / 校验 | 含义 |
 |---|---|---|
@@ -62,9 +62,36 @@ localnote.Reader.Lookup 查询 local_note 的 tenant_id/business_key，验证 re
 
 ## 复刻前提、迁移与实现范围
 
-本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次执行到 000007；不要把本文摘录再次应用到已迁移库。
+本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次执行到 000008；不要把本文摘录再次应用到已迁移库。
 
 完整服务还需要渠道协议验签、SDK PostgreSQL backend、租户密钥解析器、Redis broker、版本化配置加载和真实模型/provider 适配。SDK 表由迁移创建，SDK WithSkipDBInit(true)、WithEnableAsyncPersist(false)，禁止启动时另造 schema。本文是当前能力的复刻契约；不会把省略的基础设施宣称为“复制一段示例即可启动全部系统”。
+
+## 000008 投递回执的复刻契约
+
+下列迁移原文新增每个投递 segment 一行的不可变接受证据；直观字段表见 [design.md](design.md)。回执证明渠道 API 已返回接受，不证明客户端已经展示。旧记录没有回执时继续走对账路径，不得据此认定未发送。
+
+```sql
+BEGIN;
+CREATE TABLE public.delivery_receipt (
+ tenant_id text NOT NULL, delivery_key text NOT NULL,
+ segment_no integer NOT NULL CHECK(segment_no>=0),
+ client_request_id text NOT NULL CHECK(length(btrim(client_request_id))>0),
+ provider_message_id text NOT NULL CHECK(length(btrim(provider_message_id)) BETWEEN 1 AND 1024),
+ plan_digest text NOT NULL CHECK(plan_digest ~ '^[0-9a-f]{64}$'),
+ route_digest text NOT NULL CHECK(route_digest ~ '^[0-9a-f]{64}$'),
+ segment_digest text NOT NULL CHECK(segment_digest ~ '^[0-9a-f]{64}$'),
+ created_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY(tenant_id,delivery_key,segment_no),
+ FOREIGN KEY(tenant_id,delivery_key,segment_no) REFERENCES public.delivery_ledger(tenant_id,delivery_key,segment_no)
+);
+COMMIT;
+```
+
+ProviderReceiptStore 的 PutProviderReceipt(ctx, owner, receipt) 必须核对 tenant/key/segment、client_request_id、当前 sending 状态、版本、owner 和未过期 claim，在同一语句锁住 Ledger 后插入；重复提交仅接受全部字段相同的证据。GetProviderReceipt(ctx, key) 必须按完整租户键读取、校验字段，明确区分不存在与存储错误。路由摘要绑定 tenant/request/binding/config/target/contentRef/eventSeq/kind/contentType/final；计划摘要绑定 DeliveryPlan；segment_digest 是本次发送实际字节的 SHA-256。不能仅凭相同分段数量接受不同切分结果。
+
+发送顺序固定为 claim → 渠道调用 → 持久回执 → Ledger sent → 队列 ACK。恢复 sending 先转 ambiguous，再查匹配回执；匹配时只补 sent，无需重发。没有回执时才调用真实渠道查询；查询未知、存储故障及证据不一致均不作为重发许可。自定义 Ledger 须实现 ProviderReceiptStore 或显式注入 Receipts 才启用该能力。当前生产 PostgreSQL Store 已实现，进程内 Store 仅供测试。
+
+GET /ops/delivery/incident 返回 Ledger、可选回执和最近 100 条处置记录，多个读取不是原子快照；最终决定仍以 POST /ops/delivery/resolve 的 expected_version CAS 为准。处置与审计、Outbox 重启在同一事务；完全相同处置重试返回成功，不重复推进版本；相同旧版本的不同证据返回冲突。已有持久接受回执不能被否定为 not_delivered，也不能写入另一 provider ID。actor 由服务端添加 deployment-admin/ 命名空间，输入标签并非个人身份认证。接口使用独立 OperationsToken，不返回消息正文或凭据。
 
 ## 数据结构原文
 
@@ -901,6 +928,7 @@ func (e TerminalError) Unwrap() error { return e.Err }
 type Service struct {
 	Results              messaging.ResultStore
 	Ledger               messaging.DeliveryLedger
+	Receipts             messaging.ProviderReceiptStore
 	Adapters             AdapterResolver
 	Owner                string
 	ClaimTTL             time.Duration
@@ -964,10 +992,21 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 	}
 	if !acquired {
 		switch record.State {
-		case messaging.DeliverySent, messaging.DeliveryFailed:
+		case messaging.DeliverySent:
+			if receipts := s.receiptStore(); receipts != nil {
+				r, readErr := receipts.GetProviderReceipt(ctx, key)
+				if readErr == nil && !receiptMatches(r, record, event, contentFingerprint(content)) {
+					return runtime.ErrVersionMismatch
+				}
+				if readErr != nil && !errors.Is(readErr, runtime.ErrNotFound) {
+					return readErr
+				}
+			}
 			return nil
+		case messaging.DeliveryFailed:
+			return TerminalError{Err: errors.New("delivery segment is terminally failed")}
 		case messaging.DeliveryAmbiguous:
-			return s.reconcile(ctx, event, record)
+			return s.reconcile(ctx, event, record, contentFingerprint(content))
 		case messaging.DeliveryPending, messaging.DeliverySending, messaging.DeliveryRetryWait:
 			return DeferredError{NotBefore: record.NotBefore}
 		default:
@@ -979,16 +1018,15 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 			return err
 		}
 	}
-	contentDigest := plan.ContentDigest
-	if plan.SegmentCount > 1 {
-		sum := sha256.Sum256(content)
-		contentDigest = hex.EncodeToString(sum[:])
-	}
+	contentDigest := segmentDigest(plan, content)
 	record, resultDelivery, deliverErr := s.deliverWithClaimRenewal(ctx, adapter, channel.DeliveryRequest{
 		Event: event, ClientRequestID: record.ClientRequestID, Target: event.Target,
 		Content: append([]byte(nil), content...), ContentDigest: contentDigest, ContentType: contentType,
 	}, record, claimTTL)
 	if deliverErr != nil {
+		if resultDelivery.Delivered || resultDelivery.ProviderMessageID != "" {
+			deliverErr = AmbiguousError{Err: deliverErr}
+		}
 		var ambiguous AmbiguousError
 		if errors.As(deliverErr, &ambiguous) {
 			record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "response_lost"
@@ -1003,15 +1041,26 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 		if errors.As(deliverErr, &retryAfter) {
 			return s.finishRetry(ctx, record, deliverErr, retryAfter.RetryAfter)
 		}
-		return s.finishRetry(ctx, record, deliverErr, 0)
+		return s.finishAmbiguous(ctx, record, deliverErr, "unclassified_send_error")
 	}
 	if !resultDelivery.Delivered {
-		return s.finishRetry(ctx, record, runtime.ErrBackendUnavailable, 0)
+		return s.finishAmbiguous(ctx, record, runtime.ErrBackendUnavailable, "missing_delivery_outcome")
 	}
 	if resultDelivery.ProviderMessageID == "" {
 		record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "missing_provider_message_id"
 		_, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
 		return errors.Join(AmbiguousError{Err: runtime.ErrInvariantViolation}, finishErr)
+	}
+	if receipts := s.receiptStore(); receipts != nil {
+		r := messaging.ProviderReceipt{DeliveryKey: record.DeliveryKey, ClientRequestID: record.ClientRequestID, ProviderMessageID: resultDelivery.ProviderMessageID, PlanDigest: messaging.ReceiptDigest(record.Plan), RouteDigest: receiptRouteDigest(event), SegmentDigest: contentFingerprint(content)}
+		if err = receipts.PutProviderReceipt(ctx, record, r); err != nil {
+			return s.finishAmbiguous(ctx, record, err, "receipt_persist_failed")
+		}
+		if s.Barrier != nil {
+			if err = s.Barrier.Wait(ctx, inflight.PointP4ReceiptPersisted); err != nil {
+				return err
+			}
+		}
 	}
 	record.State = messaging.DeliverySent
 	record.ProviderMessageID = resultDelivery.ProviderMessageID
@@ -1079,9 +1128,23 @@ func splitText(content []byte, maxBytes int) [][]byte {
 	return segments
 }
 
-func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record messaging.DeliveryRecord) error {
+func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record messaging.DeliveryRecord, contentDigest string) error {
 	if record.NotBefore.After(time.Now()) {
 		return DeferredError{NotBefore: record.NotBefore}
+	}
+	if receipts := s.receiptStore(); receipts != nil {
+		r, err := receipts.GetProviderReceipt(ctx, record.DeliveryKey)
+		if err == nil {
+			if !receiptMatches(r, record, event, contentDigest) {
+				return s.deferReconciliation(ctx, record, runtime.ErrVersionMismatch)
+			}
+			record.State, record.ProviderMessageID, record.LastErrorClass = messaging.DeliverySent, r.ProviderMessageID, "provider_receipt_recovered"
+			_, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version)
+			return err
+		}
+		if !errors.Is(err, runtime.ErrNotFound) {
+			return s.deferReconciliation(ctx, record, err)
+		}
 	}
 	adapter, err := s.resolveAdapter(ctx, event)
 	if err != nil {
@@ -1091,7 +1154,7 @@ func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record
 	if !ok {
 		return s.deferReconciliation(ctx, record, runtime.ErrCapabilityUnsupported)
 	}
-	result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: record.ClientRequestID})
+	result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: record.ClientRequestID, ContentDigest: contentDigest})
 	if err != nil {
 		return s.deferReconciliation(ctx, record, err)
 	}
@@ -1187,12 +1250,45 @@ func (s Service) deliverWithClaimRenewal(ctx context.Context, adapter channel.Ad
 	renewal := <-done
 	if renewal.err != nil {
 		err := errors.Join(deliverErr, renewal.err)
-		if result.Delivered {
-			err = AmbiguousError{Err: err}
-		}
+		err = AmbiguousError{Err: err}
 		return renewal.record, result, err
 	}
 	return renewal.record, result, deliverErr
+}
+
+func (s Service) receiptStore() messaging.ProviderReceiptStore {
+	if s.Receipts != nil {
+		return s.Receipts
+	}
+	r, _ := s.Ledger.(messaging.ProviderReceiptStore)
+	return r
+}
+func segmentDigest(plan messaging.DeliveryPlan, content []byte) string {
+	if plan.SegmentCount == 1 {
+		return plan.ContentDigest
+	}
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
+func contentFingerprint(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }
+func receiptMatches(r messaging.ProviderReceipt, record messaging.DeliveryRecord, event channel.ReplyEvent, digest string) bool {
+	return r.Validate() == nil && r.DeliveryKey == record.DeliveryKey && r.ClientRequestID == record.ClientRequestID && r.PlanDigest == messaging.ReceiptDigest(record.Plan) && r.RouteDigest == receiptRouteDigest(event) && r.SegmentDigest == digest
+}
+func receiptRouteDigest(e channel.ReplyEvent) string {
+	return messaging.ReceiptDigest(struct {
+		TenantID, RequestID, BindingID, ContentRef string
+		ConfigVersion                              int64
+		Target                                     channel.DeliveryTarget
+		EventSeq                                   uint64
+		Kind, ContentType                          string
+		Final                                      bool
+	}{e.TenantID, e.RequestID, e.ChannelBindingID, e.ContentRef, e.ConfigVersion, e.Target, e.EventSeq, e.Kind, e.ContentType, e.Final})
+}
+func (s Service) finishAmbiguous(ctx context.Context, r messaging.DeliveryRecord, cause error, class string) error {
+	r.State, r.LastErrorClass = messaging.DeliveryAmbiguous, class
+	_, err := s.Ledger.FinishDelivery(ctx, r, r.Version)
+	return errors.Join(AmbiguousError{Err: cause}, err)
 }
 
 func (s Service) deferReconciliation(ctx context.Context, record messaging.DeliveryRecord, cause error) error {
@@ -1338,7 +1434,8 @@ Bot 凭据通过 Compose secrets/wecom.env 注入，模型 key 通过 secrets/de
 | result-before-commit | 冻结结果保存后、terminal/Outbox 提交前 | 原 result_ref/digest 不变，接管不再调用模型。 |
 | p3 | terminal 已提交、reply PublishReply 前 | session_commit、result_payload、已领取 reply Outbox。 |
 | p4-before-send | Ledger claim 后、provider 调用前 | 旧发送前边界，不能证明 P4 已接受。 |
-| p4 | provider 成功接受且返回消息 ID 后、Ledger sent 前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4 | provider 成功接受且返回消息 ID 后、回执落库前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| p4-receipt | delivery_receipt 已落库、Ledger sent 前 | 接管后核对摘要，只补 sent，不再次调用渠道。 |
 | tool-effect | 工具业务效果完成后、工具结果提交前 | 按业务键查外部效果，恢复不能增加效果数。 |
 
 仅 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 注册 `/test/failover/<point>/arm|status|release`，用本地 WebUI token 鉴权。arm 可带 tenant_id/request_id 过滤；status 回显命中身份/evidence。暂停控制面是进程内测试设施，不续 lease、不修改业务状态、不替系统重投。标准接管在命中后杀 owner，不对 survivor release。
@@ -1351,6 +1448,7 @@ Bot 凭据通过 Compose secrets/wecom.env 注入，模型 key 通过 secrets/de
 |---|---|
 | GET /ops/reliability | tenant_id；单条 SQL 一致快照，含 Inbox/执行/Outbox/Ledger/工具计数、最近执行尝试和异常/处置；明细各最多 100 条。 |
 | GET /ops/session/lease | tenant_id、agent_app_id、session_id；原子读 owner/fence/剩余租期，不返回 LeaseID。 |
+| GET /ops/delivery/incident | 指定 tenant_id、delivery_key、segment_no；返回元数据，不是原子快照；无记录 404，存储错误 503。 |
 | POST /ops/delivery/resolve | 外部证据核实后的版本化处置；冲突 409、输入错误 400、未授权 401、成功 204。 |
 
 处置输入为 `tenant_id, delivery_key, segment_no, expected_version, actor, evidence_ref, decision`。decision=delivered 必须带 provider_message_id；另外两种 decision 必须不带。actor 是管理调用方声明的操作人。
@@ -1600,6 +1698,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"unicode"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 )
@@ -1619,7 +1718,12 @@ type DeliveryResolution struct {
 }
 
 func (in DeliveryResolution) Validate() error {
-	if strings.TrimSpace(in.TenantID) == "" || strings.TrimSpace(in.DeliveryKey) == "" || in.SegmentNo < 0 || in.ExpectedVersion < 1 ||
+	for _, v := range []string{in.TenantID, in.DeliveryKey, in.Actor, in.EvidenceRef, in.ProviderMessageID} {
+		if strings.IndexFunc(v, unicode.IsControl) >= 0 {
+			return runtime.ErrInvalidEnvelope
+		}
+	}
+	if strings.TrimSpace(in.TenantID) == "" || len(in.TenantID) > 256 || strings.TrimSpace(in.DeliveryKey) == "" || len(in.DeliveryKey) > 1024 || in.SegmentNo < 0 || in.SegmentNo > 1<<31-1 || in.ExpectedVersion < 1 ||
 		strings.TrimSpace(in.Actor) == "" || len(in.Actor) > 256 || strings.TrimSpace(in.EvidenceRef) == "" || len(in.EvidenceRef) > 1024 {
 		return runtime.ErrInvalidEnvelope
 	}
@@ -1654,9 +1758,23 @@ func (s *Store) ResolveUncertainDelivery(ctx context.Context, in DeliveryResolut
 SET state=$5,provider_message_id=NULLIF($6,''),last_error_class=$7,not_before=now(),version=version+1,updated_at=now()
 WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$4
 AND (state='ambiguous' OR (state='failed' AND last_error_class='reconcile_exhausted'))
+AND NOT EXISTS (SELECT 1 FROM delivery_receipt r WHERE r.tenant_id=$1 AND r.delivery_key=$2 AND r.segment_no=$3
+AND ($5<>'sent' OR r.provider_message_id IS DISTINCT FROM NULLIF($6,'')))
 RETURNING version`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion, state, in.ProviderMessageID, class).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
-		return runtime.ErrVersionConflict
+		var prior DeliveryResolution
+		err = tx.QueryRowContext(ctx, `SELECT actor,evidence_ref,decision,COALESCE(provider_message_id,'') FROM delivery_resolution
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND expected_version=$4`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion).Scan(&prior.Actor, &prior.EvidenceRef, &prior.Decision, &prior.ProviderMessageID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtime.ErrVersionConflict
+		}
+		if err != nil {
+			return err
+		}
+		if prior.Actor != in.Actor || prior.EvidenceRef != in.EvidenceRef || prior.Decision != in.Decision || prior.ProviderMessageID != in.ProviderMessageID {
+			return runtime.ErrIdempotencyCollision
+		}
+		return tx.Commit()
 	}
 	if err != nil {
 		return err
