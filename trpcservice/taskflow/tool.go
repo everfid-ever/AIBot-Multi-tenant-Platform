@@ -22,7 +22,7 @@ func (Tool) Declaration() *tool.Declaration {
 		"expected_version": {Type: "integer"}, "step_id": {Type: "string"}, "note": {Type: "string"},
 		"offset": {Type: "integer", Description: "UTF-8 byte offset for read_result; initially zero"},
 		"steps": {Type: "array", Items: &tool.Schema{Type: "object", AdditionalProperties: false, Required: []string{"id", "title", "criterion", "kind"}, Properties: map[string]*tool.Schema{
-			"id": {Type: "string"}, "title": {Type: "string"}, "criterion": {Type: "string"}, "kind": {Type: "string", Enum: []any{"analysis", "tool"}}, "depends_on": {Type: "array", Items: &tool.Schema{Type: "string"}}, "tool_id": {Type: "string"}, "tool_version": {Type: "integer"},
+			"id": {Type: "string"}, "title": {Type: "string"}, "criterion": {Type: "string"}, "kind": {Type: "string", Enum: []any{"analysis", "tool"}}, "requirement_ids": {Type: "array", Items: &tool.Schema{Type: "string"}}, "depends_on": {Type: "array", Items: &tool.Schema{Type: "string"}}, "tool_id": {Type: "string"}, "tool_version": {Type: "integer"},
 			"check": {Type: "object", AdditionalProperties: false, Properties: map[string]*tool.Schema{"path": {Type: "array", Items: &tool.Schema{Type: "string"}}, "equals_json": {Type: "string", Description: "Expected JSON value at path, e.g. \"created\"; exclusive with non_empty"}, "non_empty": {Type: "boolean"}}},
 		}}},
 	}}}

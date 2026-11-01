@@ -1,5 +1,11 @@
 # 在途任务接管与幂等投递 — 实现走读
 
+## 本轮新增的目标与最终输出闸门
+
+运行顺序更新为：加载持久输入并解码 → Open → 首次 BindAcceptance / 接管复用原合同 → Recover → 恢复已有候选或结果 → BeginAttempt → 模型规划/工具执行 → 渲染 → ValidateFinal → 保存完成候选 → 原治理结算 → PutResult → SealFinal → terminal/Outbox。任何新答案缺项都停在候选和结算之前；completion_issue 与原进度一起持久保存。此时被杀后，新 owner 读取原合同、原已完成步骤和修复原因，不重新定义目标。
+
+候选已存在时，则重新验证其 PlanDigest、合同和内容；认证或证据矛盾不降级为新的普通模型尝试。具体原文见 CODE-APPENDIX 的 completion.go 及 acceptance.go。
+
 ## 000005 步骤级恢复的实际接入顺序
 
 1. Runner 核对原 envelope、顺序和 payload 后调用 taskflow Store.Open，以原输入 SHA-256、payload key version 和会话 fence 创建或接管计划。Redis 提交前检查也用于计划写入前资格检查。

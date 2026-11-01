@@ -459,7 +459,7 @@ func (w RunnerExecutor) saveCompletion(ctx context.Context, e runtime.ExecutionE
 	}
 	c := completionCandidate{SchemaVersion: 2, Envelope: e, InputDigest: taskflow.Digest(payload.Content), Usage: runnerModelUsages(permit.Model, result), Output: out}
 	if task := taskflow.FromContext(ctx); task != nil {
-		p, err := task.ValidateCompletion(ctx)
+		p, err := task.ValidateFinal(ctx, out.Content)
 		if err != nil {
 			return messaging.CompletionRecord{}, err
 		}
@@ -506,7 +506,7 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 		return runtime.ErrVersionMismatch
 	}
 	if task := taskflow.FromContext(ctx); task != nil {
-		p, err := task.ValidateCompletion(ctx)
+		p, err := task.ValidateFinal(ctx, c.Output.Content)
 		if err != nil {
 			return err
 		}
@@ -610,6 +610,15 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 // Fence/version/phase change during adoption/sealing; declared obligations and
 // their evidence must remain identical to those reviewed with this candidate.
 func completionPlanDigest(p taskflow.Plan) string {
+	if p.Acceptance != nil {
+		b, _ := json.Marshal(struct {
+			InputDigest string
+			Contract    taskflow.Contract
+			Steps       []taskflow.Step
+			Acceptance  *taskflow.Acceptance
+		}{p.InputDigest, p.Contract, p.Steps, p.Acceptance})
+		return taskflow.Digest(b)
+	}
 	b, _ := json.Marshal(struct {
 		InputDigest string
 		Contract    taskflow.Contract
@@ -1309,5 +1318,309 @@ func (s *Store) GetProviderReceipt(ctx context.Context, k messaging.DeliveryKey)
 		return r, err
 	}
 	return r, r.Validate()
+}
+```
+
+## 完成条件代码：trpcservice/taskflow/acceptance.go
+
+来源：`trpcservice/taskflow/acceptance.go`，完整文件。字段与边界见 design；最终判定针对冻结合同和实际输出，不依赖模型自报完成。
+
+```go
+package taskflow
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+)
+
+// Requirement is supplied by trusted application code, never checkpoint arguments.
+// Literal and receipt checks are deterministic constraints, not semantic graders.
+type Requirement struct {
+	ID             string   `json:"id"`
+	Description    string   `json:"description"`
+	ToolID         string   `json:"tool_id,omitempty"`
+	ToolVersion    int64    `json:"tool_version,omitempty"`
+	OutputContains []string `json:"output_contains,omitempty"`
+	EvidencePath   []string `json:"evidence_path,omitempty"`
+}
+
+type Acceptance struct {
+	Version      int           `json:"version"`
+	InputDigest  string        `json:"input_digest"`
+	Objective    string        `json:"objective"`
+	Requirements []Requirement `json:"requirements"`
+}
+
+func (a Acceptance) Validate() error {
+	if a.Version != 1 || len(a.InputDigest) != 64 || strings.TrimSpace(a.Objective) == "" || len(a.Objective) > 64<<10 || len(a.Requirements) > 32 {
+		return runtime.ErrInvalidEnvelope
+	}
+	seen := map[string]bool{}
+	for _, r := range a.Requirements {
+		if !validID(r.ID) || seen[r.ID] || strings.TrimSpace(r.Description) == "" || len(r.Description) > 1024 || len(r.ToolID) > 256 || (r.ToolID == "") != (r.ToolVersion == 0) || r.ToolVersion < 0 || len(r.OutputContains) > 16 || len(r.EvidencePath) > 8 || (len(r.EvidencePath) > 0 && r.ToolID == "") {
+			return runtime.ErrInvalidEnvelope
+		}
+		seen[r.ID] = true
+		for _, v := range r.OutputContains {
+			if strings.TrimSpace(v) == "" || len(v) > 4096 {
+				return runtime.ErrInvalidEnvelope
+			}
+		}
+		for _, v := range r.EvidencePath {
+			if v == "" || len(v) > 128 {
+				return runtime.ErrInvalidEnvelope
+			}
+		}
+	}
+	return nil
+}
+
+// BindAcceptance freezes the original objective before planning. An adopted
+// legacy plan must not acquire new obligations retroactively.
+func (s *Session) BindAcceptance(ctx context.Context, a Acceptance) (Plan, error) {
+	p, err := s.load(ctx)
+	if err != nil {
+		return p, err
+	}
+	if err = a.Validate(); err != nil {
+		return p, err
+	}
+	if a.InputDigest != p.InputDigest {
+		return p, runtime.ErrVersionMismatch
+	}
+	if p.Acceptance != nil {
+		x, _ := json.Marshal(p.Acceptance)
+		y, _ := json.Marshal(a)
+		if string(x) != string(y) {
+			return p, runtime.ErrIdempotencyCollision
+		}
+		return p, nil
+	}
+	if p.Phase != "open" || p.Attempts != 0 || len(p.Steps) != 0 {
+		return p, runtime.ErrVersionConflict
+	}
+	// Copy caller-owned slices before the store receives the contract.
+	b, _ := json.Marshal(a)
+	var frozen Acceptance
+	_ = json.Unmarshal(b, &frozen)
+	p.Acceptance = &frozen
+	return s.save(ctx, p)
+}
+
+func validateStepRequirements(a *Acceptance, st Step) error {
+	seen := map[string]bool{}
+	for _, id := range st.RequirementIDs {
+		if a == nil || seen[id] {
+			return runtime.ErrInvalidEnvelope
+		}
+		seen[id] = true
+		found := false
+		for _, r := range a.Requirements {
+			if r.ID == id {
+				found = true
+				if r.ToolID != "" && (st.Kind != "tool" || st.ToolID != r.ToolID || st.ToolVersion != r.ToolVersion) {
+					return ErrEvidenceRequired
+				}
+			}
+		}
+		if !found {
+			return runtime.ErrInvalidEnvelope
+		}
+	}
+	return nil
+}
+
+func validateCoverage(p Plan) error {
+	if p.Acceptance == nil {
+		return nil
+	}
+	if err := p.Acceptance.Validate(); err != nil {
+		return err
+	}
+	if p.Acceptance.InputDigest != p.InputDigest {
+		return runtime.ErrVersionMismatch
+	}
+	covered := map[string]bool{}
+	for _, st := range p.Steps {
+		if err := validateStepRequirements(p.Acceptance, st); err != nil {
+			return err
+		}
+		for _, id := range st.RequirementIDs {
+			covered[id] = true
+		}
+	}
+	for _, r := range p.Acceptance.Requirements {
+		if !covered[r.ID] {
+			return fmt.Errorf("missing required deliverable %s: %w", r.ID, ErrIncomplete)
+		}
+	}
+	return nil
+}
+
+// ValidateFinal rechecks authoritative receipts, coverage and the actual rendered
+// output before candidate persistence and again before recovery/terminal commit.
+func (s *Session) ValidateFinal(ctx context.Context, content []byte) (p Plan, err error) {
+	defer func() {
+		if err != nil && errors.Is(err, ErrIncomplete) && p.Phase == "open" && p.Acceptance != nil && p.CompletionIssue != err.Error() {
+			p.CompletionIssue = err.Error()
+			if len(p.CompletionIssue) > 1024 {
+				p.CompletionIssue = p.CompletionIssue[:1024]
+			}
+			saved, saveErr := s.save(ctx, p)
+			if saveErr != nil {
+				err = saveErr
+			} else {
+				p = saved
+			}
+		}
+	}()
+	p, err = s.ValidateCompletion(ctx)
+	if err != nil {
+		return p, err
+	}
+	if p.Acceptance == nil {
+		return p, nil
+	}
+	if strings.TrimSpace(string(content)) == "" {
+		return p, fmt.Errorf("empty final deliverable: %w", ErrIncomplete)
+	}
+	if p.Phase == "sealed" && p.FinalDigest != Digest(content) {
+		return p, runtime.ErrVersionMismatch
+	}
+	for _, r := range p.Acceptance.Requirements {
+		for _, text := range r.OutputContains {
+			if !strings.Contains(string(content), text) {
+				return p, fmt.Errorf("final answer missing required content for %s: %w", r.ID, ErrIncomplete)
+			}
+		}
+		if len(r.EvidencePath) == 0 {
+			continue
+		}
+		matched := false
+		for _, st := range p.Steps {
+			if !containsID(st.RequirementIDs, r.ID) {
+				continue
+			}
+			_, b, e := s.verifyTool(ctx, st, p.Contract.RequireToolChecks)
+			if e != nil {
+				return p, e
+			}
+			v, e := decodeJSON(b)
+			if e != nil {
+				return p, ErrEvidenceRejected
+			}
+			for _, path := range r.EvidencePath {
+				obj, ok := v.(map[string]any)
+				if !ok {
+					v = nil
+					break
+				}
+				v = obj[path]
+			}
+			var text string
+			switch x := v.(type) {
+			case string:
+				text = x
+			case json.Number:
+				text = x.String()
+			}
+			if strings.TrimSpace(text) != "" && strings.Contains(string(content), text) {
+				matched = true
+			}
+		}
+		if !matched {
+			return p, fmt.Errorf("final answer lacks verified receipt value for %s: %w", r.ID, ErrIncomplete)
+		}
+	}
+	return p, nil
+}
+
+func containsID(ids []string, id string) bool {
+	for _, v := range ids {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+```
+
+## 完成条件代码：trpcservice/worker/acceptance.go
+
+来源：`trpcservice/worker/acceptance.go`，完整文件。字段与边界见 design；最终判定针对冻结合同和实际输出，不依赖模型自报完成。
+
+```go
+package worker
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+// TaskRequirementResolver derives reviewed business acceptance conditions from
+// the pinned execution configuration/input. It runs only before first planning;
+// takeover reuses the frozen contract, even when configuration has changed.
+type TaskRequirementResolver func(context.Context, runtime.ExecutionEnvelope, model.Message) ([]taskflow.Requirement, error)
+
+func (w RunnerExecutor) bindTaskAcceptance(ctx context.Context, task *taskflow.Session, e runtime.ExecutionEnvelope, message model.Message, policy map[string]any) error {
+	p, err := task.Store.Get(ctx, task.Scope.Key)
+	if err != nil {
+		return err
+	}
+	if p.Acceptance != nil {
+		if p.Acceptance.InputDigest != p.InputDigest {
+			return runtime.ErrVersionMismatch
+		}
+		return p.Acceptance.Validate()
+	}
+	// Retain the interpretation of candidates and plans created before this feature.
+	if p.Phase != "open" || p.Attempts != 0 || len(p.Steps) != 0 {
+		return nil
+	}
+	objective := message.Content
+	if strings.TrimSpace(objective) == "" {
+		objective = "Respond to the original persisted multimodal user input."
+	}
+	// Full input remains authoritative in payload storage, bound by InputDigest.
+	if len(objective) > 60<<10 {
+		end := 60 << 10
+		for !utf8.ValidString(objective[:end]) {
+			end--
+		}
+		objective = objective[:end] + "\n[Objective excerpt; full original input is retained under input_digest.]"
+	}
+	a := taskflow.Acceptance{Version: 1, InputDigest: p.InputDigest, Objective: objective}
+	if configured, ok := policy["task_requirements"]; ok {
+		b, marshalErr := json.Marshal(configured)
+		if marshalErr != nil || len(b) > 64<<10 || string(b) == "null" {
+			return runtime.ErrInvalidEnvelope
+		}
+		d := json.NewDecoder(bytes.NewReader(b))
+		d.DisallowUnknownFields()
+		if err = d.Decode(&a.Requirements); err != nil {
+			return runtime.ErrInvalidEnvelope
+		}
+	}
+	if w.TaskRequirements != nil {
+		extra, resolveErr := w.TaskRequirements(ctx, e, message)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		a.Requirements = append(a.Requirements, extra...)
+	}
+	_, err = task.BindAcceptance(ctx, a)
+	return err
 }
 ```

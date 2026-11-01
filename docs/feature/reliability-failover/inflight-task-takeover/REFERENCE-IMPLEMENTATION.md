@@ -1,5 +1,32 @@
 # 在途任务接管与幂等投递 — 参考实现
 
+## 完成条件配置与函数契约
+
+以下配置属于已发布 Agent App 的 `runtime_policy`，随原发布摘要及执行 profile 固定。不是用户聊天消息或 task_checkpoint 的入参，也不是进程全局可变开关。示例工具名和字段须替换成实际审核过的注册工具及结果结构。
+
+```json
+{
+  "task_requirements": [
+    {"id":"summary","description":"输出比较结果与结论","output_contains":["比较结果","结论"]},
+    {"id":"created_record","description":"创建并返回真实记录编号","tool_id":"create_record","tool_version":1,"evidence_path":["record_id"]}
+  ]
+}
+```
+
+模型在 define 的 steps 中使用 `requirement_ids:["summary"]` 或 `["created_record"]` 关联覆盖关系。第二项必须由精确 create_record@1 的工具步骤覆盖，仍须提供原有 check 并满足工具可信完成契约。`output_contains` 对渲染字节逐项包含校验，evidence_path 只接受经过验证的工具结果中的非空字符串或 JSON 数字；没有匹配值不能提交成功。完整字段约束见 design。
+
+| 函数 | 必须保持的语义 |
+|---|---|
+| Worker.bindTaskAcceptance | 在首次规划前冻结原输入目标和发布配置要求；已有合同仅复用，旧活动计划不 retroactively 绑定。可选 TaskRequirementResolver 只能追加首次要求，不能替换发布配置要求。 |
+| Session.BindAcceptance | 核对原 InputDigest，当前 Fence/版本写入；已有完全相同合同可幂等重读，不同合同拒绝；未绑定但已开始执行的计划拒绝追加初始化。 |
+| Session.Define | 映射 ID 必须存在且唯一；指定工具的要求不能被分析步骤或其他工具版本覆盖。 |
+| Session.ValidateCompletion | 原步骤/依赖/账本核验后，逐个必需要求检查覆盖，不因步骤全绿而跳过覆盖。 |
+| Session.ValidateFinal | 对当前渲染输出检查，缺项持久记录 completion_issue 并返回 ErrIncomplete；不是直接把新草稿当成不可恢复候选冲突。 |
+| completionPlanDigest | 存在 Acceptance 时纳入原目标、必需条件及原步骤证据；无 Acceptance 时保持旧摘要格式。诊断原因和封存状态不参与内容义务摘要。 |
+| Session.SealFinal | 重新读取及检查实际冻结内容，保存 final_digest；同 ref、同字节幂等，换字节拒绝。 |
+
+新字段保存在原加密计划和快照，不新增 DDL；现有 256 KiB 计划密文前大小限制继续生效，不能因各字段单独合法就绕过整体上限。
+
 ## 步骤检查点、失败收敛与完成候选与投递回执增量契约（000005–000008）
 
 在本文原有 000001–000004 基础上依次应用 `000005_task_checkpoints`、`000006_task_failure_convergence`、`000007_execution_completion`、`000008_delivery_receipt`。新表、合同、计数和数据库写入保护见 [design.md](design.md)；实现入口还包括 `trpcservice/worker/completion.go`、`storage/messaging/postgres/completion.go` 与 `governance/service.go`。

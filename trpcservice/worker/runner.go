@@ -72,6 +72,7 @@ type RunnerExecutor struct {
 	Payloads          messaging.PayloadStore
 	Completions       messaging.CompletionStore
 	TaskPlans         taskflow.Store
+	TaskRequirements  TaskRequirementResolver
 	ToolExecutions    toolexecution.Store
 	Artifacts         artifact.Store
 	Inputs            InputDecoder
@@ -154,6 +155,9 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	snapshot, err := w.Profiles.Resolve(ctx, key)
 	if err != nil {
 		return fmt.Errorf("resolve execution profile: %w", err)
+	}
+	if _, configured := snapshot.RuntimePolicy["task_requirements"]; (configured || w.TaskRequirements != nil) && w.TaskPlans == nil {
+		return runtime.ErrCapabilityUnsupported
 	}
 	if snapshot.TenantVersion != envelope.TenantVersion || snapshot.AgentAppVersion != envelope.AgentAppVersion {
 		return runtime.ErrVersionMismatch
@@ -255,6 +259,13 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	if payload.PayloadRef != envelope.PayloadRef {
 		return runtime.ErrVersionMismatch
 	}
+	message, err := w.Inputs.DecodeInput(ctx, envelope, payload.Content)
+	if err != nil {
+		return fmt.Errorf("decode execution payload: %w", err)
+	}
+	if message.Role != model.RoleUser || (strings.TrimSpace(message.Content) == "" && len(message.ContentParts) == 0) || !validPreparedMessage(message) {
+		return runtime.ErrInvalidEnvelope
+	}
 	if w.TaskPlans != nil {
 		results, ok := w.ToolExecutions.(toolexecution.DurableResults)
 		if !ok {
@@ -271,6 +282,12 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		}
 		task := &taskflow.Session{Store: w.TaskPlans, Tools: w.ToolExecutions, Results: results, Scope: scope, BeforeWrite: beforeCommit}
 		ctx = taskflow.WithSession(ctx, task)
+		if err := w.bindTaskAcceptance(ctx, task, envelope, message, snapshot.RuntimePolicy); err != nil {
+			if errors.Is(err, runtime.ErrInvalidEnvelope) {
+				return w.commitTaskFailure(ctx, task, turn, envelope, head, fence, beforeCommit, modelRef, payload.KeyVersion, "task_acceptance_invalid")
+			}
+			return err
+		}
 		if _, err := task.Recover(ctx); err != nil {
 			if reason := taskflow.StopReason(err); reason != "" {
 				if recoveryReason(reason) {
@@ -303,13 +320,6 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 				resultErr = w.commitTaskFailure(ctx, task, turn, envelope, head, fence, beforeCommit, modelRef, payload.KeyVersion, reason)
 			}
 		}()
-	}
-	message, err := w.Inputs.DecodeInput(ctx, envelope, payload.Content)
-	if err != nil {
-		return fmt.Errorf("decode execution payload: %w", err)
-	}
-	if message.Role != model.RoleUser || (strings.TrimSpace(message.Content) == "" && len(message.ContentParts) == 0) || !validPreparedMessage(message) {
-		return runtime.ErrInvalidEnvelope
 	}
 	if err := w.hydrateArtifacts(ctx, envelope, &message); err != nil {
 		return fmt.Errorf("hydrate execution artifacts: %w", err)
@@ -720,13 +730,7 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		return err
 	}
 	content := runResult.Content
-	// Do not settle the governance reservation or freeze a false success:
-	// the next owner must be able to finish the outstanding obligations.
-	if task := taskflow.FromContext(ctx); task != nil {
-		if _, err := task.ValidateCompletion(ctx); err != nil {
-			return err
-		}
-	}
+	// saveCompletion checks the rendered deliverable before settlement or freezing.
 	latest, err := w.Tasks.GetExecution(ctx, gateway.ExecutionKey{TenantID: envelope.TenantID, RequestID: envelope.RequestID})
 	if err != nil {
 		return err
@@ -740,6 +744,13 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	outbound, err := renderOutbound(ctx, w.OutputRenderer, envelope, content)
 	if err != nil {
 		return fmt.Errorf("render outbound result: %w", err)
+	}
+	// A fresh incomplete answer is repairable; do not classify it as a
+	// contradiction in an already persisted completion candidate.
+	if task := taskflow.FromContext(ctx); task != nil {
+		if _, err := task.ValidateFinal(ctx, outbound.Content); err != nil {
+			return err
+		}
 	}
 	record, err := w.saveCompletion(ctx, envelope, fence, beforeCommit, payload, permit, runResult, outbound)
 	if err != nil {
@@ -775,7 +786,18 @@ func (w RunnerExecutor) commitFrozenSuccess(ctx context.Context, turn *sessionst
 		}
 	}
 	if task := taskflow.FromContext(ctx); task != nil {
-		if err := task.Seal(ctx, resultRef); err != nil {
+		results, ok := w.Payloads.(messaging.ResultStore)
+		if !ok {
+			return runtime.ErrCapabilityUnsupported
+		}
+		frozen, err := results.GetResult(ctx, envelope.TenantID, envelope.RequestID)
+		if err != nil {
+			return err
+		}
+		if frozen.ResultRef != resultRef {
+			return runtime.ErrVersionMismatch
+		}
+		if err := task.SealFinal(ctx, resultRef, frozen.Content); err != nil {
 			return err
 		}
 	}

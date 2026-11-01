@@ -30,8 +30,10 @@ import (
 // The script goes through the real SDK tool surface, then deliberately tries
 // to finish before the declared obligation has evidence.
 type checkpointModel struct {
-	calls     int
-	recovered bool
+	answer         string
+	requirementIDs []string
+	calls          int
+	recovered      bool
 }
 
 func (m *checkpointModel) GenerateContent(ctx context.Context, r *model.Request) (<-chan *model.Response, error) {
@@ -51,7 +53,11 @@ func (m *checkpointModel) GenerateContent(ctx context.Context, r *model.Request)
 		3: `{"action":"start","expected_version":2,"step_id":"analyze"}`,
 		4: `{"action":"complete_analysis","expected_version":3,"step_id":"analyze","note":"2+3=5"}`,
 	}
-	msg := model.NewAssistantMessage("answer: 5")
+	answer := m.answer
+	if answer == "" {
+		answer = "answer: 5"
+	}
+	msg := model.NewAssistantMessage(answer)
 	if command, ok := commands[m.calls]; ok {
 		p, err := taskflow.FromContext(ctx).Store.Get(ctx, taskflow.FromContext(ctx).Scope.Key)
 		if err != nil {
@@ -62,6 +68,11 @@ func (m *checkpointModel) GenerateContent(ctx context.Context, r *model.Request)
 			return nil, err
 		}
 		input["expected_version"] = p.Version
+		if steps, ok := input["steps"].([]any); ok && len(m.requirementIDs) > 0 {
+			for _, st := range steps {
+				st.(map[string]any)["requirement_ids"] = m.requirementIDs
+			}
+		}
 		encoded, _ := json.Marshal(input)
 		command = string(encoded)
 		msg = model.Message{Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: fmt.Sprintf("checkpoint-%d", m.calls), Type: "function", Function: model.FunctionDefinitionParam{Name: taskflow.ToolName, Arguments: []byte(command)}}}}
@@ -147,6 +158,77 @@ func TestRunnerTaskCompletionGateAndFrozenRecoveryUseOriginalPlan(t *testing.T) 
 	}
 	p, err := plans.Get(context.Background(), taskflow.Key{TenantID: e.TenantID, RequestID: e.RequestID})
 	if err != nil || p.Phase != "sealed" || p.Steps[0].Note != "2+3=5" || p.Fence != 3 {
+		t.Fatalf("plan: %+v %v", p, err)
+	}
+	terminal, err := sessions.GetTerminalByInputSeq(context.Background(), sessionstore.TerminalKey{SessionKey: sessionstore.SessionKey{TenantID: e.TenantID, AgentAppID: e.AgentAppID, SessionID: e.SessionID}, InputSeq: 1})
+	if err != nil || terminal.Outcome != runtime.OutcomeSucceeded || terminal.ResultRef != p.FinalRef {
+		t.Fatal(terminal, err)
+	}
+}
+
+func TestRunnerRejectsFinalMissingConfiguredDeliverableBeforeSettlement(t *testing.T) {
+	e := runtime.ExecutionEnvelope{SchemaVersion: 1, TenantID: "tenant-a", TenantVersion: 1, AgentAppID: "app", AgentAppVersion: 1, AgentAppRevision: 1, AgentContentDigest: "digest", ConfigVersion: 1, PolicyVersion: 1, RequestID: "request", SessionID: "session", UserID: "user", Channel: "fake", InputSeq: 1, PayloadRef: "payload://request", CreatedAt: time.Now().UTC()}
+	k := profile.ExecutionProfileKey{TenantID: e.TenantID, TenantVersion: 1, AgentAppID: e.AgentAppID, AgentAppVersion: 1, AgentAppRevision: 1, ContentDigest: "digest", ConfigVersion: 1, PolicyVersion: 1}
+	snapshot := profile.ExecutionProfileSnapshot{Key: k, TenantVersion: 1, AgentAppVersion: 1, ContentDigest: "digest", AppName: "tenant-a/app", AgentKind: agentapp.AgentKindLLM, Instruction: "solve", ModelProfileRef: profile.VersionedRef{ID: "mock", Version: 1}}
+	snapshot.RuntimePolicy = profile.RuntimePolicyV1{"task_requirements": []taskflow.Requirement{{ID: "answer", Description: "verified calculation answer", OutputContains: []string{"verified"}}}}
+	profiles := profilememory.NewResolver(snapshot)
+	m := &checkpointModel{requirementIDs: []string{"answer"}}
+	factory := serviceagent.Factory{Profiles: profiles, Models: staticModelResolver{model: m}, TaskPlans: true}
+	bundles := profilememory.NewBundleManager(func(ctx context.Context, _ profile.ExecutionProfileKey) (profile.RuntimeBundle, func(context.Context) error, error) {
+		root, err := factory.Build(ctx, snapshot)
+		return &serviceagent.Bundle{AppName: snapshot.AppName, Root: root}, nil, err
+	})
+	payloads := messagingmemory.New()
+	if err := payloads.PutPayload(context.Background(), messaging.PayloadRecord{TenantID: e.TenantID, RequestID: e.RequestID, PayloadRef: e.PayloadRef, Content: []byte(`{"text":"calculate 2+3, save the analysis, then answer"}`), ContentDigest: "digest", KeyVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	plans := taskmemory.New()
+	sessions := sessionmemory.New()
+	barrier := &crashBeforeTerminal{}
+	w := RunnerExecutor{Tasks: taskStub{envelope: e}, Profiles: profiles, Bundles: bundles, Sessions: sessions, SDKSessions: sdkmemory.NewSessionService(), Payloads: payloads, Inputs: JSONTextInputDecoder{}, TaskPlans: plans, ToolExecutions: unusedToolResults{}, Barrier: barrier}
+	guard := &taskRunGuard{confirmationRunGuard: confirmationRunGuard{policy: governance.PolicySnapshot{TenantID: e.TenantID, Version: 1, Policy: governance.PolicyV1{SchemaVersion: 1, DefaultAction: governance.ActionAllow}}}}
+	w.Governance = guard
+	if err := w.ExecuteWithLease(context.Background(), e, 1, nil); !errors.Is(err, taskflow.ErrIncomplete) {
+		t.Fatalf("premature success allowed: %v", err)
+	}
+	if guard.finishes != 0 {
+		t.Fatal("incomplete task settled its reservation")
+	}
+	if _, err := payloads.GetResult(context.Background(), e.TenantID, e.RequestID); !errors.Is(err, runtime.ErrNotFound) {
+		t.Fatalf("premature frozen result: %v", err)
+	}
+	if err := w.ExecuteWithLease(context.Background(), e, 2, nil); !errors.Is(err, taskflow.ErrIncomplete) {
+		t.Fatalf("missing final requirement accepted: %v", err)
+	}
+	if guard.finishes != 0 {
+		t.Fatal("rejected final answer settled governance")
+	}
+	if _, err := payloads.GetCompletion(context.Background(), e.TenantID, e.RequestID); !errors.Is(err, runtime.ErrNotFound) {
+		t.Fatalf("rejected candidate persisted: %v", err)
+	}
+	if _, err := payloads.GetResult(context.Background(), e.TenantID, e.RequestID); !errors.Is(err, runtime.ErrNotFound) {
+		t.Fatalf("rejected public answer persisted: %v", err)
+	}
+	pBefore, _ := plans.Get(context.Background(), taskflow.Key{TenantID: e.TenantID, RequestID: e.RequestID})
+	if !strings.Contains(pBefore.CompletionIssue, "answer") {
+		t.Fatal("missing persistent repair instruction")
+	}
+	m.answer = "verified answer: 5"
+	if err := w.ExecuteWithLease(context.Background(), e, 3, nil); !errors.Is(err, runtime.ErrLeaseLost) {
+		t.Fatalf("crash boundary: %v", err)
+	}
+	if !m.recovered {
+		t.Fatal("new run did not receive durable pending plan")
+	}
+	calls := m.calls
+	if err := w.ExecuteWithLease(context.Background(), e, 4, nil); err != nil {
+		t.Fatal(err)
+	}
+	if m.calls != calls {
+		t.Fatal("frozen answer regenerated")
+	}
+	p, err := plans.Get(context.Background(), taskflow.Key{TenantID: e.TenantID, RequestID: e.RequestID})
+	if err != nil || p.Phase != "sealed" || p.Steps[0].Note != "2+3=5" || p.Fence != 4 {
 		t.Fatalf("plan: %+v %v", p, err)
 	}
 	terminal, err := sessions.GetTerminalByInputSeq(context.Background(), sessionstore.TerminalKey{SessionKey: sessionstore.SessionKey{TenantID: e.TenantID, AgentAppID: e.AgentAppID, SessionID: e.SessionID}, InputSeq: 1})

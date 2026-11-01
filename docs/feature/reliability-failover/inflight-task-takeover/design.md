@@ -1,5 +1,43 @@
 # 在途任务接管与幂等投递 — 设计文档
 
+## 原始目标、必需交付物与最终输出校验
+
+本轮在现有加密 Plan 中加入 Acceptance，不另建表。`task_plan.ciphertext` 保存当前完整合同，`task_checkpoint.ciphertext` 保存每次修改后的快照，沿用 tenant/request/input_digest/version/key_version 的 AAD、会话 Fence 和版本 CAS。部署迁移仍须执行到 000008。该能力不是用模型自报“完成”作为唯一依据：配置声明的必需交付物必须被步骤覆盖，实际渲染答案必须通过确定性检查。
+
+### 数据字段与来源
+
+| 对象 / 字段 | 设计与约束 | 权威来源及作用 |
+|---|---|---|
+| Plan.`acceptance` | 可选对象；新任务自动创建，旧活动计划保留原语义 | Worker 在模型运行前冻结，checkpoint 工具没有修改入口。 |
+| Acceptance.`version` | 当前 1 | 合同格式版本，与任务预算 Contract.Version 分开。 |
+| Acceptance.`input_digest` | 原始持久输入完整字节的 SHA-256，必须与 Plan 一致 | 目标关联完整原输入，不能把模型摘要当作原始需求。 |
+| Acceptance.`objective` | 非空，最多 64 KiB | 来自输入解码后的用户文本；超过 60 KiB 保存明确标注的摘要截段；完整原输入仍在 payload 中。纯多模态输入使用固定说明和原输入摘要。 |
+| Acceptance.`requirements` | 最多 32 项；ID 唯一 | 发布版本的 runtime_policy.task_requirements，加上可选可信 TaskRequirementResolver 的补充；两者合并而非覆盖。 |
+| Requirement.`id` / `description` | ID 为合法步骤标识，说明非空且 <=1024 字节 | 独立于模型计划定义的必需交付物。 |
+| Requirement.`tool_id` / `tool_version` | 同时指定或同时为空；指定版本为正数 | 指定时，只允许该工具及精确版本的 tool 步骤覆盖，分析步骤不能冒充。 |
+| Requirement.`output_contains` | 最多 16 个非空字符串，各 <=4096 字节 | 每个字符串都必须出现在最终渲染字节中；是字面检查，不是语义判断。 |
+| Requirement.`evidence_path` | 最多 8 层对象字段，须指定工具 | 从通过账本、摘要和断言核对的工具结果提取非空字符串或精确 JSON 数字，要求最终答案包含该值。布尔、数组及对象不能作为该引用值。 |
+| Step.`requirement_ids` | 引用冻结合同中的 ID，不可重复 | 模型可绑定步骤与要求，不能创建、删除或放宽服务端要求。已有步骤与映射仍只追加、不重写。 |
+| Plan.`completion_issue` | 修复原因，最多 1024 字节 | 当前新答案被拒绝时持久保存；恢复提示中可见，不计为已完成进展，封存时清除。 |
+| Plan.`final_digest` | 最终渲染字节 SHA-256 | SealFinal 时保存；同一封存结果不能替换成另一份答案。 |
+
+### 执行与恢复的判定
+
+1. Worker 加载并解码持久输入，Open 原任务计划。全新且未尝试、未规划的任务绑定合同；已有合同直接校验并复用，不再次调用解析器，也不使用后续配置替换它。
+2. define 校验 requirement_ids 的存在性、重复项及工具身份。ValidateCompletion 先恢复可信工具结果，核对所有步骤及依赖成功，再检查每个必需要求至少有一个覆盖步骤。
+3. 模型输出经 OutputRenderer 后，ValidateFinal 检查非空答案、必含内容及回执字段引用。缺项返回 ErrIncomplete 并保存 completion_issue；不保存成功候选、不结算、不发布成功结果，下一次执行在原尝试/无进展/期限预算内修复。
+4. saveCompletion 再检查最终字节。新合同进入 SchemaVersion=2 候选的 PlanDigest；无 Acceptance 的旧计划沿用旧摘要计算，避免人为改变已保存证据。
+5. 恢复已有候选时重新核对合同、步骤证据与输出。候选已持久化后发现矛盾走既有 completion_conflict 审计失败，不允许模型重写原候选来掩盖冲突。
+6. 最后提交前读取公开冻结结果，经 SealFinal 再验证并保存 final_digest，随后提交成功 terminal/Outbox。带 Acceptance 的计划不能使用只提供结果引用的 Seal 绕过输出检查。
+
+配置了 task_requirements 却未装配 TaskPlans 的 Executor 拒绝运行。非法条件在新任务绑定阶段以 task_acceptance_invalid 收敛失败；解析器的依赖暂时不可用不被当作业务成功。只有完成新答案的缺项可修复，工具结果认证错误、未知外部效果和既有候选冲突继续遵循原有安全边界。
+
+### 明确边界
+
+未配置业务要求时，新合同只绑定原始目标，并保留非空计划、全部步骤证据与非空最终输出要求；系统不会自动把任意自然语言请求完整拆成可靠的验收规范。配置者或可信业务解析器负责提供完整、可验证的必需条件。字符串包含和回执值引用也不能证明全文没有其他错误、没有遗漏未配置需求，或任意外部业务效果正确。需要更强语义保证时，应补充具体业务校验器和外部读回检查；不能将本机制写成通用答案正确率保证。
+
+旧活动计划不被追加新要求。新旧应用混跑或回滚可能让旧 Worker 忽略新合同字段，发布须先排空旧执行者；不能把 JSON 可向前读取当作执行语义兼容。
+
 ## 000008：P4 持久回执、保守判定与受控处置
 
 当前将“渠道已返回成功”和“可恢复的发送证据已保存”分开。发送正常返回 Delivered=true 与非空 ProviderMessageID 后，先把不可变回执写入 delivery_receipt，再把 Ledger 从 sending 改为 sent。新 owner 遇到 ambiguous 时先查回执，完整匹配后补 sent，不再次调用渠道；没有回执才使用渠道真实查询能力。此机制覆盖**回执落库后、Ledger 确认前**的故障，不消除渠道接受到回执落库之前的窗口。

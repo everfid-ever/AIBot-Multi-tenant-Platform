@@ -35,6 +35,9 @@ func TestSaveCheckpointsEncryptedAndAtomicWithFenceAndVersion(t *testing.T) {
 	s := New(db, keys{})
 	p := taskflow.Plan{Scope: taskflow.Scope{Key: taskflow.Key{TenantID: "t", RequestID: "r"}, Fence: 7}, Version: 1, InputDigest: taskflow.Digest([]byte("input")), KeyVersion: 1, Phase: "open", Steps: []taskflow.Step{{ID: "a", Title: "private goal", Kind: "analysis", State: "pending"}}}
 	p.Contract = taskflow.DefaultContract()
+	p.Acceptance = &taskflow.Acceptance{Version: 1, InputDigest: p.InputDigest, Objective: "private original objective", Requirements: []taskflow.Requirement{{ID: "required", Description: "private deliverable", OutputContains: []string{"receipt"}}}}
+	p.Steps[0].RequirementIDs = []string{"required"}
+	p.CompletionIssue = "missing final receipt"
 	p.Attempts = 2
 	p.NoProgress = 1
 	c, n := &capture{}, &capture{}
@@ -46,7 +49,7 @@ func TestSaveCheckpointsEncryptedAndAtomicWithFenceAndVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(c.b, []byte("private goal")) || len(n.b) != 12 {
+	if bytes.Contains(c.b, []byte("private goal")) || bytes.Contains(c.b, []byte("private original objective")) || len(n.b) != 12 {
 		t.Fatal("checkpoint plaintext exposed")
 	}
 	rows := func() *sqlmock.Rows {
@@ -55,7 +58,7 @@ func TestSaveCheckpointsEncryptedAndAtomicWithFenceAndVersion(t *testing.T) {
 	// A new owner changes the fence, not the immutable checkpoint ciphertext.
 	m.ExpectQuery("SELECT fence").WithArgs("t", "r").WillReturnRows(rows())
 	got, err := s.Get(context.Background(), p.Key)
-	if err != nil || got.Fence != 8 || got.Steps[0].Title != "private goal" || got.Contract != p.Contract || got.Attempts != 2 || got.NoProgress != 1 {
+	if err != nil || got.Fence != 8 || got.Steps[0].Title != "private goal" || got.Contract != p.Contract || got.Attempts != 2 || got.NoProgress != 1 || got.Acceptance == nil || got.Acceptance.Objective != p.Acceptance.Objective || got.Acceptance.Requirements[0].OutputContains[0] != "receipt" || got.Steps[0].RequirementIDs[0] != "required" || got.CompletionIssue != p.CompletionIssue {
 		t.Fatal(got, err)
 	}
 	m.ExpectQuery("SELECT fence").WithArgs("other", "r").WillReturnRows(rows())

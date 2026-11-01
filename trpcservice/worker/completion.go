@@ -44,7 +44,7 @@ func (w RunnerExecutor) saveCompletion(ctx context.Context, e runtime.ExecutionE
 	}
 	c := completionCandidate{SchemaVersion: 2, Envelope: e, InputDigest: taskflow.Digest(payload.Content), Usage: runnerModelUsages(permit.Model, result), Output: out}
 	if task := taskflow.FromContext(ctx); task != nil {
-		p, err := task.ValidateCompletion(ctx)
+		p, err := task.ValidateFinal(ctx, out.Content)
 		if err != nil {
 			return messaging.CompletionRecord{}, err
 		}
@@ -91,7 +91,7 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 		return runtime.ErrVersionMismatch
 	}
 	if task := taskflow.FromContext(ctx); task != nil {
-		p, err := task.ValidateCompletion(ctx)
+		p, err := task.ValidateFinal(ctx, c.Output.Content)
 		if err != nil {
 			return err
 		}
@@ -195,6 +195,15 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 // Fence/version/phase change during adoption/sealing; declared obligations and
 // their evidence must remain identical to those reviewed with this candidate.
 func completionPlanDigest(p taskflow.Plan) string {
+	if p.Acceptance != nil {
+		b, _ := json.Marshal(struct {
+			InputDigest string
+			Contract    taskflow.Contract
+			Steps       []taskflow.Step
+			Acceptance  *taskflow.Acceptance
+		}{p.InputDigest, p.Contract, p.Steps, p.Acceptance})
+		return taskflow.Digest(b)
+	}
 	b, _ := json.Marshal(struct {
 		InputDigest string
 		Contract    taskflow.Contract
