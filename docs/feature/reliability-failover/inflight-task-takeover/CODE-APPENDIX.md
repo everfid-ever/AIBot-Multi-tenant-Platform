@@ -1,5 +1,287 @@
 # 在途任务接管与幂等投递 — 实现代码附录
 
+## local_note 业务事实读取与同键结果认证
+
+来源：`trpcservice/tool/localnote/postgres/store.go`，完整文件。本文件完整展示 Create/Lookup 共用的 AES-GCM 认证路径。同键重试返回原密文结果，不能回显未核验的入参；原 key_version 保留后可跨轮换读取。
+
+```go
+package postgres
+
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"database/sql"
+	"encoding/json"
+	"errors"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tool/localnote"
+)
+
+type Store struct {
+	DB   *sql.DB
+	Keys messaging.PayloadKeyResolver
+}
+
+func (s Store) aead(ctx context.Context, tenant string, version int64) (cipher.AEAD, error) {
+	if s.Keys == nil || tenant == "" || version < 1 {
+		return nil, runtime.ErrCapabilityUnsupported
+	}
+	key, err := s.Keys.ResolvePayloadKey(ctx, tenant, version)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(key.Bytes)
+	if key.Version != version || len(key.Bytes) != 32 {
+		return nil, runtime.ErrVersionMismatch
+	}
+	block, err := aes.NewCipher(key.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+func noteAAD(k localnote.LookupKey, version int64) []byte {
+	b, _ := json.Marshal([]any{"local-note-v1", k.TenantID, k.RequestID, k.BusinessKey, k.ArgsDigest, version})
+	return b
+}
+func (s Store) decode(ctx context.Context, k localnote.LookupKey, id string, encrypted, nonce []byte, version int64) (localnote.Result, error) {
+	a, err := s.aead(ctx, k.TenantID, version)
+	if err != nil {
+		return localnote.Result{}, err
+	}
+	if len(nonce) != a.NonceSize() || len(encrypted) < a.Overhead() || len(encrypted) > 64<<10 {
+		return localnote.Result{}, runtime.ErrInvariantViolation
+	}
+	b, err := a.Open(nil, nonce, encrypted, noteAAD(k, version))
+	if err != nil {
+		return localnote.Result{}, runtime.ErrInvariantViolation
+	}
+	defer clear(b)
+	var r localnote.Result
+	if err = json.Unmarshal(b, &r); err != nil || r.NoteID != id || r.Status != "created" {
+		return localnote.Result{}, runtime.ErrVersionMismatch
+	}
+	return r, nil
+}
+
+// Create returns the authenticated EXISTING result on key collision; it must
+// not claim success merely by echoing the current caller's desired content.
+func (s Store) Create(ctx context.Context, in localnote.Note) (localnote.Result, error) {
+	if in.Result.Status != "created" || in.Result.NoteID == "" || len(in.Result.Title) > 200 || len(in.Result.Content) > 4000 {
+		return localnote.Result{}, runtime.ErrInvalidEnvelope
+	}
+	if s.DB == nil || in.TenantID == "" || in.BusinessKey == "" || in.RequestID == "" || in.ArgsDigest == "" || in.KeyVersion < 1 {
+		return localnote.Result{}, runtime.ErrCapabilityUnsupported
+	}
+	a, err := s.aead(ctx, in.TenantID, in.KeyVersion)
+	if err != nil {
+		return localnote.Result{}, err
+	}
+	k := localnote.LookupKey{TenantID: in.TenantID, RequestID: in.RequestID, BusinessKey: in.BusinessKey, ArgsDigest: in.ArgsDigest}
+	b, err := json.Marshal(in.Result)
+	if err != nil {
+		return localnote.Result{}, err
+	}
+	defer clear(b)
+	nonce := make([]byte, a.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return localnote.Result{}, err
+	}
+	encrypted := a.Seal(nil, nonce, b, noteAAD(k, in.KeyVersion))
+	var request, digest, id string
+	var saved, iv []byte
+	var version int64
+	err = s.DB.QueryRowContext(ctx, `INSERT INTO local_note(tenant_id,business_key,request_id,note_id,args_digest,ciphertext,nonce,key_version)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(tenant_id,business_key) DO UPDATE SET business_key=EXCLUDED.business_key
+RETURNING request_id,note_id,args_digest,ciphertext,nonce,key_version`, in.TenantID, in.BusinessKey, in.RequestID, in.Result.NoteID, in.ArgsDigest, encrypted, nonce, in.KeyVersion).Scan(&request, &id, &digest, &saved, &iv, &version)
+	if err != nil {
+		return localnote.Result{}, err
+	}
+	if request != in.RequestID || digest != in.ArgsDigest || id != in.Result.NoteID {
+		return localnote.Result{}, runtime.ErrIdempotencyCollision
+	}
+	r, err := s.decode(ctx, k, id, saved, iv, version)
+	if err != nil {
+		return localnote.Result{}, err
+	}
+	if r != in.Result {
+		return localnote.Result{}, runtime.ErrIdempotencyCollision
+	}
+	return r, nil
+}
+
+func (s Store) Lookup(ctx context.Context, k localnote.LookupKey) (localnote.Result, error) {
+	if s.DB == nil {
+		return localnote.Result{}, runtime.ErrCapabilityUnsupported
+	}
+	if k.TenantID == "" || k.RequestID == "" || k.BusinessKey == "" || k.ArgsDigest == "" {
+		return localnote.Result{}, runtime.ErrTenantScope
+	}
+	var request, id, digest string
+	var encrypted, nonce []byte
+	var version int64
+	err := s.DB.QueryRowContext(ctx, `SELECT request_id,note_id,args_digest,ciphertext,nonce,key_version FROM local_note WHERE tenant_id=$1 AND business_key=$2`, k.TenantID, k.BusinessKey).Scan(&request, &id, &digest, &encrypted, &nonce, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return localnote.Result{}, runtime.ErrNotFound
+	}
+	if err != nil {
+		return localnote.Result{}, err
+	}
+	if request != k.RequestID || digest != k.ArgsDigest {
+		return localnote.Result{}, runtime.ErrIdempotencyCollision
+	}
+	return s.decode(ctx, k, id, encrypted, nonce, version)
+}
+
+var _ localnote.Reader = Store{}
+```
+
+
+## MCP 同端点状态查询与回执解码
+
+来源：`trpcservice/tool/mcp/lookup.go`，完整文件。查询不经过写操作 Call；验证原操作键、声明、MCP isError 和固定状态协议，单文本 JSON 保持数字精度。仅支持经配置审核的供应商协议，不证明远端实际上只读。
+
+```go
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
+)
+
+type LookupConfig struct {
+	ToolName                  string
+	ExpectedDeclarationDigest string
+	KeyParameter              string
+}
+
+func (c callable) RecoveryLookupEnabled() bool { return c.config.Lookup != nil }
+
+func (c callable) LookupRecovery(ctx context.Context, key string) (servicetool.RecoveryResult, error) {
+	lookup := c.config.Lookup
+	if lookup == nil {
+		return servicetool.RecoveryResult{}, runtime.ErrCapabilityUnsupported
+	}
+	expected, err := c.RecoveryKey(ctx)
+	if err != nil {
+		return servicetool.RecoveryResult{}, err
+	}
+	if key == "" || key != expected {
+		return servicetool.RecoveryResult{}, runtime.ErrVersionMismatch
+	}
+	set, remote, err := c.openNamed(ctx, lookup.ToolName, lookup.ExpectedDeclarationDigest, lookup.KeyParameter)
+	if err != nil {
+		return servicetool.RecoveryResult{}, err
+	}
+	defer set.Close()
+	args, _ := json.Marshal(map[string]string{lookup.KeyParameter: key})
+	r, err := remote.Call(ctx, args)
+	if err != nil {
+		return servicetool.RecoveryResult{}, err
+	}
+	if failure, ok := r.(interface{ RetryResultError() bool }); ok && failure.RetryResultError() {
+		return servicetool.RecoveryResult{}, runtime.ErrEffectUnknown
+	}
+	b, err := json.Marshal(r)
+	if err != nil || len(b) > maxResultBytes {
+		return servicetool.RecoveryResult{}, runtime.ErrCapabilityUnsupported
+	}
+	object, err := decodeJSONObject(b)
+	if err != nil {
+		return servicetool.RecoveryResult{}, err
+	}
+	b, err = json.Marshal(object)
+	if err != nil {
+		return servicetool.RecoveryResult{}, err
+	}
+	var receipt struct {
+		OperationKey string                    `json:"operation_key"`
+		State        servicetool.RecoveryState `json:"state"`
+		Result       json.RawMessage           `json:"result,omitempty"`
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if err = d.Decode(&receipt); err != nil || receipt.OperationKey != key {
+		return servicetool.RecoveryResult{}, runtime.ErrVersionMismatch
+	}
+	if d.Decode(new(any)) != io.EOF {
+		return servicetool.RecoveryResult{}, runtime.ErrInvariantViolation
+	}
+	result := servicetool.RecoveryResult{State: receipt.State}
+	switch receipt.State {
+	case servicetool.RecoveryCompleted:
+		if len(receipt.Result) == 0 || bytes.Equal(bytes.TrimSpace(receipt.Result), []byte("null")) {
+			return result, runtime.ErrInvariantViolation
+		}
+		decoder := json.NewDecoder(bytes.NewReader(receipt.Result))
+		decoder.UseNumber()
+		if err = decoder.Decode(&result.Result); err != nil {
+			return result, err
+		}
+	case servicetool.RecoveryNotFound, servicetool.RecoveryPending, servicetool.RecoveryFailed, servicetool.RecoveryUnknown:
+		if len(receipt.Result) > 0 && !bytes.Equal(bytes.TrimSpace(receipt.Result), []byte("null")) {
+			return result, runtime.ErrInvariantViolation
+		}
+	default:
+		return result, runtime.ErrInvariantViolation
+	}
+	return result, nil
+}
+
+// Only an object or exactly one MCP text content block containing an object is
+// admitted. Multiple blocks, prose prefixes and malformed JSON are ambiguous.
+func decodeJSONObject(b []byte) (map[string]any, error) {
+	canonical, _, err := governance.CanonicalArguments(b)
+	if err != nil {
+		return nil, runtime.ErrInvariantViolation
+	}
+	b = canonical
+	object, err := decodeObject(b)
+	if err == nil {
+		return object, nil
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(b, &blocks); err != nil || len(blocks) != 1 || blocks[0].Type != "text" {
+		return nil, runtime.ErrInvariantViolation
+	}
+	return decodeObject([]byte(blocks[0].Text))
+}
+
+func decodeObject(b []byte) (map[string]any, error) {
+	canonical, _, err := governance.CanonicalArguments(b)
+	if err != nil {
+		return nil, runtime.ErrInvariantViolation
+	}
+	b = canonical
+	var object map[string]any
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.UseNumber()
+	if err := d.Decode(&object); err != nil || object == nil {
+		return nil, runtime.ErrInvariantViolation
+	}
+	if d.Decode(new(any)) != io.EOF {
+		return nil, runtime.ErrInvariantViolation
+	}
+	return object, nil
+}
+
+var _ servicetool.RecoveryLookup = callable{}
+```
+
+
 ## 恢复判定与异常收敛
 
 来源：`trpcservice/worker/recovery.go`，完整文件。候选优先交叉校验，恢复矛盾以原请求 failed/audit 结束并保留证据；普通依赖失败返回原阶段重试。对应 recovery_state_test.go。
@@ -394,6 +676,15 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		key = execution.TenantID + ":" + execution.RequestID + ":" + execution.ToolCallID
 	}
 	in := toolexecution.Record{Key: toolexecution.Key{TenantID: execution.TenantID, RequestID: execution.RequestID, ToolCallID: execution.ToolCallID}, ToolID: g.Tool.ID, ToolVersion: g.Tool.Version, ArgsDigest: digest, Policy: string(policy), IdempotencyKey: key}
+	if task := taskflow.FromContext(ctx); task != nil {
+		var check *taskflow.ResultCheck
+		if descriptor, ok := g.Inner.(taskflow.EvidenceDescriptor); ok {
+			check = descriptor.TaskEvidenceCheck()
+		}
+		if err := task.BeforeTool(ctx, in, canonical, check); err != nil {
+			return nil, err
+		}
+	}
 	match := func(record toolexecution.Record) bool {
 		return record.ToolID == in.ToolID && record.ToolVersion == in.ToolVersion && record.ArgsDigest == in.ArgsDigest && record.Policy == in.Policy && record.IdempotencyKey == in.IdempotencyKey
 	}
@@ -402,13 +693,26 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		if err != nil {
 			return nil, err
 		}
+		if record.ResultRef != "tool-result://sha256/"+taskflow.Digest(content) {
+			return nil, runtime.ErrVersionMismatch
+		}
+		if err = verifyToolReceipt(g.Inner, content); err != nil {
+			return nil, err
+		}
 		if confirmed {
 			if err = g.mirrorConfirmedResult(ctx, execution, content, record.ResultRef); err != nil {
 				return nil, err
 			}
 		}
 		var value any
-		err = json.Unmarshal(content, &value)
+		decoder := json.NewDecoder(bytes.NewReader(content))
+		decoder.UseNumber()
+		err = decoder.Decode(&value)
+		if err == nil {
+			if task := taskflow.FromContext(ctx); task != nil {
+				err = task.RecordTool(ctx)
+			}
+		}
 		return value, err
 	}
 	existing, err := g.Executions.Get(ctx, in.Key)
@@ -472,6 +776,20 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		}
 	}()
 	defer func() { stopRenew(); stop(context.Canceled); <-done }()
+	finishState := func(state toolexecution.State, reason string) error {
+		stopRenew()
+		<-done
+		if cause := context.Cause(callCtx); cause != nil {
+			return cause
+		}
+		_, finishErr := g.Executions.Finish(callCtx, running, state, "", reason)
+		if finishErr == nil && state == toolexecution.Failed {
+			if task := taskflow.FromContext(ctx); task != nil {
+				return task.RecordTool(callCtx)
+			}
+		}
+		return finishErr
+	}
 	resumingConsumed := false
 	if confirmed {
 		_, err = g.Grants.ConsumeGrant(callCtx, governance.GrantClaim{TenantID: execution.TenantID, GrantID: execution.GrantID, RequestID: execution.RequestID, SubjectID: execution.SubjectID, Tool: g.Tool, ToolCallID: execution.ToolCallID, ArgsDigest: digest, PolicyVersion: execution.PolicyVersion, ExpectedVersion: execution.GrantVersion})
@@ -484,11 +802,36 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		}
 	}
 	if (running.Attempt > 1 || resumingConsumed) && policy == RecoveryManual {
-		_, err = g.Executions.Finish(callCtx, running, toolexecution.EffectUnknown, "", "manual recovery required")
+		err = finishState(toolexecution.EffectUnknown, "manual recovery required")
 		return nil, errors.Join(runtime.ErrEffectUnknown, err)
 	}
 	var value any
 	completed := false
+	if lookup, ok := g.Inner.(RecoveryLookup); ok && policy == RecoveryIdempotentKey && lookup.RecoveryLookupEnabled() && (running.Attempt > 1 || resumingConsumed) {
+		var observed RecoveryResult
+		observed, err = lookup.LookupRecovery(callCtx, key)
+		if cause := context.Cause(callCtx); cause != nil {
+			return nil, cause
+		}
+		if err != nil {
+			finishErr := finishState(toolexecution.EffectUnknown, "recovery_lookup_error")
+			return nil, errors.Join(err, finishErr)
+		}
+		switch observed.State {
+		case RecoveryCompleted:
+			value, completed = observed.Result, true
+		case RecoveryNotFound:
+		case RecoveryPending:
+			finishErr := finishState(toolexecution.EffectUnknown, "recovery_pending")
+			return nil, errors.Join(ErrRecoveryPending, finishErr)
+		case RecoveryFailed:
+			finishErr := finishState(toolexecution.Failed, "external_operation_failed")
+			return nil, errors.Join(ErrRecoveryFailed, finishErr)
+		default:
+			finishErr := finishState(toolexecution.EffectUnknown, "recovery_unknown")
+			return nil, errors.Join(runtime.ErrEffectUnknown, finishErr)
+		}
+	}
 	if policy == RecoveryQueryable {
 		querier, ok := g.Inner.(RecoveryQuerier)
 		if !ok {
@@ -496,7 +839,7 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		}
 		value, completed, err = querier.QueryRecovery(callCtx, key)
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, finishState(toolexecution.EffectUnknown, "recovery_lookup_error"))
 		}
 	}
 	if !completed {
@@ -506,7 +849,7 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		return nil, cause
 	}
 	if err != nil {
-		_, finishErr := g.Executions.Finish(callCtx, running, toolexecution.EffectUnknown, "", "tool call outcome unknown")
+		finishErr := finishState(toolexecution.EffectUnknown, "tool call outcome unknown")
 		return nil, errors.Join(err, finishErr)
 	}
 	if err = inflight.Wait(inflight.WithScope(callCtx, execution.TenantID, execution.RequestID, "tool_call:"+execution.ToolCallID), inflight.PointToolEffectBeforeCommit); err != nil {
@@ -515,6 +858,10 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 	content, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
+	}
+	if err = verifyToolReceipt(g.Inner, content); err != nil {
+		finishErr := finishState(toolexecution.Failed, "tool_receipt_rejected")
+		return nil, errors.Join(err, finishErr)
 	}
 	// Stop renewal before the atomic success transition: a renewal observing
 	// our own 'succeeded' row must not cancel the confirmation-result mirror.
@@ -530,7 +877,22 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 	if confirmed {
 		err = g.mirrorConfirmedResult(callCtx, execution, content, running.ResultRef)
 	}
+	if err == nil {
+		if task := taskflow.FromContext(ctx); task != nil {
+			err = task.RecordTool(ctx)
+		}
+	}
 	return value, err
+}
+
+func verifyToolReceipt(inner interface{}, content []byte) error {
+	if _, _, err := governance.CanonicalArguments(content); err != nil {
+		return taskflow.ErrEvidenceRejected
+	}
+	if d, ok := inner.(taskflow.EvidenceDescriptor); ok {
+		return d.TaskEvidenceCheck().Verify(content)
+	}
+	return nil
 }
 
 func (g GuardedCallable) mirrorConfirmedResult(ctx context.Context, execution runtime.ExecutionContext, content []byte, ref string) error {

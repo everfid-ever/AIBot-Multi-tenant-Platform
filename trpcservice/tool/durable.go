@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -82,13 +83,21 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		if err != nil {
 			return nil, err
 		}
+		if record.ResultRef != "tool-result://sha256/"+taskflow.Digest(content) {
+			return nil, runtime.ErrVersionMismatch
+		}
+		if err = verifyToolReceipt(g.Inner, content); err != nil {
+			return nil, err
+		}
 		if confirmed {
 			if err = g.mirrorConfirmedResult(ctx, execution, content, record.ResultRef); err != nil {
 				return nil, err
 			}
 		}
 		var value any
-		err = json.Unmarshal(content, &value)
+		decoder := json.NewDecoder(bytes.NewReader(content))
+		decoder.UseNumber()
+		err = decoder.Decode(&value)
 		if err == nil {
 			if task := taskflow.FromContext(ctx); task != nil {
 				err = task.RecordTool(ctx)
@@ -157,6 +166,20 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		}
 	}()
 	defer func() { stopRenew(); stop(context.Canceled); <-done }()
+	finishState := func(state toolexecution.State, reason string) error {
+		stopRenew()
+		<-done
+		if cause := context.Cause(callCtx); cause != nil {
+			return cause
+		}
+		_, finishErr := g.Executions.Finish(callCtx, running, state, "", reason)
+		if finishErr == nil && state == toolexecution.Failed {
+			if task := taskflow.FromContext(ctx); task != nil {
+				return task.RecordTool(callCtx)
+			}
+		}
+		return finishErr
+	}
 	resumingConsumed := false
 	if confirmed {
 		_, err = g.Grants.ConsumeGrant(callCtx, governance.GrantClaim{TenantID: execution.TenantID, GrantID: execution.GrantID, RequestID: execution.RequestID, SubjectID: execution.SubjectID, Tool: g.Tool, ToolCallID: execution.ToolCallID, ArgsDigest: digest, PolicyVersion: execution.PolicyVersion, ExpectedVersion: execution.GrantVersion})
@@ -169,11 +192,36 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		}
 	}
 	if (running.Attempt > 1 || resumingConsumed) && policy == RecoveryManual {
-		_, err = g.Executions.Finish(callCtx, running, toolexecution.EffectUnknown, "", "manual recovery required")
+		err = finishState(toolexecution.EffectUnknown, "manual recovery required")
 		return nil, errors.Join(runtime.ErrEffectUnknown, err)
 	}
 	var value any
 	completed := false
+	if lookup, ok := g.Inner.(RecoveryLookup); ok && policy == RecoveryIdempotentKey && lookup.RecoveryLookupEnabled() && (running.Attempt > 1 || resumingConsumed) {
+		var observed RecoveryResult
+		observed, err = lookup.LookupRecovery(callCtx, key)
+		if cause := context.Cause(callCtx); cause != nil {
+			return nil, cause
+		}
+		if err != nil {
+			finishErr := finishState(toolexecution.EffectUnknown, "recovery_lookup_error")
+			return nil, errors.Join(err, finishErr)
+		}
+		switch observed.State {
+		case RecoveryCompleted:
+			value, completed = observed.Result, true
+		case RecoveryNotFound:
+		case RecoveryPending:
+			finishErr := finishState(toolexecution.EffectUnknown, "recovery_pending")
+			return nil, errors.Join(ErrRecoveryPending, finishErr)
+		case RecoveryFailed:
+			finishErr := finishState(toolexecution.Failed, "external_operation_failed")
+			return nil, errors.Join(ErrRecoveryFailed, finishErr)
+		default:
+			finishErr := finishState(toolexecution.EffectUnknown, "recovery_unknown")
+			return nil, errors.Join(runtime.ErrEffectUnknown, finishErr)
+		}
+	}
 	if policy == RecoveryQueryable {
 		querier, ok := g.Inner.(RecoveryQuerier)
 		if !ok {
@@ -181,7 +229,7 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		}
 		value, completed, err = querier.QueryRecovery(callCtx, key)
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, finishState(toolexecution.EffectUnknown, "recovery_lookup_error"))
 		}
 	}
 	if !completed {
@@ -191,7 +239,7 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		return nil, cause
 	}
 	if err != nil {
-		_, finishErr := g.Executions.Finish(callCtx, running, toolexecution.EffectUnknown, "", "tool call outcome unknown")
+		finishErr := finishState(toolexecution.EffectUnknown, "tool call outcome unknown")
 		return nil, errors.Join(err, finishErr)
 	}
 	if err = inflight.Wait(inflight.WithScope(callCtx, execution.TenantID, execution.RequestID, "tool_call:"+execution.ToolCallID), inflight.PointToolEffectBeforeCommit); err != nil {
@@ -200,6 +248,10 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 	content, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
+	}
+	if err = verifyToolReceipt(g.Inner, content); err != nil {
+		finishErr := finishState(toolexecution.Failed, "tool_receipt_rejected")
+		return nil, errors.Join(err, finishErr)
 	}
 	// Stop renewal before the atomic success transition: a renewal observing
 	// our own 'succeeded' row must not cancel the confirmation-result mirror.
@@ -221,6 +273,16 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		}
 	}
 	return value, err
+}
+
+func verifyToolReceipt(inner interface{}, content []byte) error {
+	if _, _, err := governance.CanonicalArguments(content); err != nil {
+		return taskflow.ErrEvidenceRejected
+	}
+	if d, ok := inner.(taskflow.EvidenceDescriptor); ok {
+		return d.TaskEvidenceCheck().Verify(content)
+	}
+	return nil
 }
 
 func (g GuardedCallable) mirrorConfirmedResult(ctx context.Context, execution runtime.ExecutionContext, content []byte, ref string) error {

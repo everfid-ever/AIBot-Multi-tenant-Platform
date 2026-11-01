@@ -27,13 +27,15 @@ MCP 恢复默认 manual；经代码审核的 ReadOnly 才允许重放，经审�
 
 ## 工具恢复的执行顺序
 
+当前 idempotent_key 工具可额外提供 RecoveryLookup：接管先查原业务键，completed 复用结果，not_found 同键继续，pending/unknown/异常不回退写入，failed 终结工具。实际 local_note 已接上业务表查询，Create 重试也会认证并返回原密文结果；MCP 提供显式审核的 LookupConfig 和 JSONTextResult，未知提供商没有自动获得查询/重放能力。代码自有完成回执在 Complete 前及旧结果复用时都校验，大整数 ID 保留精度。见[工具设计](design.md#状态查询优先与可信回执前置校验)。
+
 1. `GuardedCallable.callDurable` 校验租户执行上下文、payload key version、规范化参数及工具版本。普通 allow 的 operation ID 是 tenant/request/tool/version/参数摘要的 SHA-256；同一输入的同工具同参数视为同一逻辑操作。需要不同效果时必须带不同业务参数/键。ask 使用确认中的持久化调用 ID。
-2. 读取 tool_execution。已 succeeded 且不可变字段一致时，LoadResult 解密并校验摘要，直接复用；failed 拒绝继续。未知新工具默认 manual。
+2. 读取 tool_execution。已 succeeded 且不可变字段一致时，LoadResult 解密、校验结果引用摘要与代码自有可信断言后复用；failed 拒绝继续。未知新工具默认 manual。
 3. Claim 首次创建 running，或领取 pending/effect_unknown/过期 running；attempt 和工具 fence 增加。未过期 running 不可抢占。
 4. 启动工具续租。ask 消费 grant；遇到已消费冲突时仅允许恢复同 request/tool-call 且 effect_unknown 的 attempt，不再次消费授权。
-5. 恢复时 queryable 先查询；completed=false 必须证明外部操作未被接受，pending/unknown 必须返回错误。idempotent_key 同键调用；replay_safe 重放；manual 再次尝试收敛为 effect_unknown，任务可终结为 tool_effect_unknown。
+5. idempotent_key 若启用 RecoveryLookup，恢复先查原业务键：completed 复用回执，not_found 同键继续，pending/unknown/查询错误不写，failed 终结工具；未配置时保持原同键调用。旧 queryable 协议仍要求 false 证明未接受，未知不得当 false；replay_safe 重放；manual 接管保留 effect_unknown 并安全停止。
 6. 外部调用错误可将 tool_execution 标为 effect_unknown；lease 丢失立即取消 call context。外部系统若不响应取消，仍由其幂等/查询协议避免重复业务效果。
-7. 成功后停止续租，Complete 在同一 PostgreSQL 事务中验证 owner/fence/未过期租期、把执行置 succeeded 并写入 AES-GCM 加密的 tool_execution_result。任何一步失败均回滚。
+7. 实际调用或查询补回结果先验证 JSON 与代码自有可信完成断言；拒绝回执标为 failed/tool_receipt_rejected，不创建成功结果。校验通过后停止续租，Complete 在同一 PG 事务中验证 owner/fence/有效租期并写 succeeded 和加密结果。失败/未知状态落库也先停止续租。
 8. ask 再把结果镜像至 tool_result_payload 并完成 tool_attempt；镜像前故障可从 tool_execution_result 重建。业务效果与平台结果是两个事务；local_note 用 (tenant_id,business_key) 唯一键覆盖这段窗口。
 
 恢复的是已保存结果或外部操作的协议状态，不会恢复工具函数体的内存/指令位置。未冻结最终结果时模型可能重新推理；相同逻辑操作重新进入 GuardedCallable 时复用或安全恢复。任意 Graph 检查点也不能据此推断为自动恢复整张图的执行栈。

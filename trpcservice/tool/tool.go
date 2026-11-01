@@ -243,6 +243,21 @@ func (t tenantBoundCallable) QueryRecovery(ctx context.Context, key string) (any
 	return nil, false, runtime.ErrCapabilityUnsupported
 }
 
+func (t tenantBoundCallable) RecoveryLookupEnabled() bool {
+	d, ok := t.inner.(RecoveryLookup)
+	return ok && d.RecoveryLookupEnabled()
+}
+func (t tenantBoundCallable) LookupRecovery(ctx context.Context, key string) (RecoveryResult, error) {
+	e, ok := runtime.ExecutionContextFrom(ctx)
+	if !ok || e.TenantID != t.tenantID {
+		return RecoveryResult{}, runtime.ErrTenantScope
+	}
+	if d, ok := t.inner.(RecoveryLookup); ok && d.RecoveryLookupEnabled() {
+		return d.LookupRecovery(ctx, key)
+	}
+	return RecoveryResult{}, runtime.ErrCapabilityUnsupported
+}
+
 func (t tenantBoundCallable) Call(ctx context.Context, args []byte) (any, error) {
 	if t.inner == nil {
 		return nil, runtime.ErrCapabilityUnsupported

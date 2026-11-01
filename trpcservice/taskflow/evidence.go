@@ -20,6 +20,10 @@ type ResultCheck struct {
 // Valid lets reviewed adapters reject malformed evidence contracts at registration.
 func (c *ResultCheck) Valid() bool { return c.valid() }
 
+// Verify allows the durable tool boundary to reject false success BEFORE
+// publishing a succeeded receipt, even outside a participating task plan.
+func (c *ResultCheck) Verify(content []byte) error { return c.verify(content) }
+
 func (c *ResultCheck) valid() bool {
 	if c == nil {
 		return true

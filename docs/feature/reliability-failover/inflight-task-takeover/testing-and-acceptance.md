@@ -1,5 +1,18 @@
 # 在途任务接管与幂等投递 — 测试与验收
 
+## 工具查询优先与业务效果计数回归
+
+| 回归 | 代码证据 | 判据 |
+|---|---|---|
+| local_note 业务写入后工具结果落盘失败，再以新计划 Fence 接管 | tool/localnote/recovery_test.go | 原 grant 仅成功消费一次；Create 调用 1、Lookup 1、业务行 1、工具尝试 2；原 tool-call/结果引用/检查点及授权镜像恢复。 |
+| completed/not_found/pending/failed/unknown/非法查询状态 | tool/lookup_test.go | completed 不写；not_found 同键继续且模拟业务效果仍一份；其他状态不写；失败与未知落对应账本状态。 |
+| 查询不可用 | tool/lookup_test.go | effect_unknown/recovery_lookup_error，不能被当作不存在并调用写操作。 |
+| 新调用及旧 succeeded 结果的业务断言失败 | tool/lookup_test.go | 不新增成功结果或业务效果；新回执 failed/tool_receipt_rejected。 |
+| 原业务密文读取、密钥轮换、同键不同正文、损坏和跨请求 | tool/localnote/postgres/store_test.go | 返回认证的原结果；错误/缺失分别返回，不能回显假成功。 |
+| 真实 SDK MCP 查询及单文本 JSON 协议 | tool/mcp/lookup_test.go | 固定原操作键/租户凭据；大整数 ID 精度不变；声明变化、isError、错键、重复键和含糊内容拒绝。 |
+
+tool_execution.attempt 统计领取尝试，包括仅查询恢复的尝试，不等于实际写调用数。local_note 业务效果按唯一业务行核对；MCP 外部效果数量仍需供应商业务记录证明。本地假服务和 SQL mock 验证代码协议，不证明外部供应商实现了去重、只读查询或完成真实部署演练。
+
 ## 恢复状态交叉校验回归
 
 `worker/recovery_state_test.go` 覆盖候选与公开结果冲突、候选读取损坏、完成计划修订、sealed 无结果、恢复 failed 计划后 terminal 写入再次失败、旧候选兼容、同一时刻不同时区表示以及临时数据库错误。矛盾状态必须 failed/audit、无可疑 reply、原证据不覆盖且下一 input_seq 可推进；临时错误不能被误判为业务终态，也不能进入模型路径。

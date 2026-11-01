@@ -51,6 +51,10 @@ type Config struct {
 	ReadOnly             bool
 	IdempotencyParameter string
 	CompletionCheck      *taskflow.ResultCheck
+	// Lookup names a reviewed read-only operation on the SAME endpoint. Its
+	// receipt protocol is fixed by lookup.go, not inferred from descriptions.
+	Lookup         *LookupConfig
+	JSONTextResult bool
 
 	// clientOptions is only an in-package test seam. Production registrations
 	// use the fixed options assembled by newToolSet.
@@ -87,6 +91,9 @@ func NewRegistration(tenantID, localID string, version int64, config Config, sec
 }
 
 func (c Config) validate(localID string, secretRef secrets.SecretRef) error {
+	if c.Lookup != nil && (c.IdempotencyParameter == "" || c.Lookup.ToolName == c.RemoteToolName || !validToolID(c.Lookup.ToolName) || !validToolID(c.Lookup.KeyParameter) || !validDigest(c.Lookup.ExpectedDeclarationDigest)) {
+		return runtime.ErrInvariantViolation
+	}
 	if !c.CompletionCheck.Valid() || (c.ReadOnly && c.IdempotencyParameter != "") ||
 		(c.IdempotencyParameter != "" && (!validToolID(c.IdempotencyParameter) || c.CompletionCheck == nil)) {
 		return runtime.ErrInvariantViolation
@@ -142,12 +149,14 @@ func BindingDigest(config Config, secretRef secrets.SecretRef) (string, error) {
 	}
 	// Preserve bindings with no newly granted contract. Any explicit contract
 	// changes the pinned digest and requires publishing a reviewed revision.
-	if config.ReadOnly || config.IdempotencyParameter != "" || config.CompletionCheck != nil {
+	if config.ReadOnly || config.IdempotencyParameter != "" || config.CompletionCheck != nil || config.Lookup != nil || config.JSONTextResult {
 		contract, err := json.Marshal(struct {
 			ReadOnly             bool
 			IdempotencyParameter string
 			CompletionCheck      *taskflow.ResultCheck
-		}{config.ReadOnly, config.IdempotencyParameter, config.CompletionCheck})
+			Lookup               *LookupConfig `json:",omitempty"`
+			JSONTextResult       bool          `json:",omitempty"`
+		}{config.ReadOnly, config.IdempotencyParameter, config.CompletionCheck, config.Lookup, config.JSONTextResult})
 		if err != nil {
 			return "", err
 		}
@@ -175,6 +184,10 @@ func DeclarationDigest(value *agenttool.Declaration) (string, error) {
 func (c Config) clone() Config {
 	c.clientOptions = append([]tmcp.ClientOption(nil), c.clientOptions...)
 	c.CompletionCheck = cloneCheck(c.CompletionCheck)
+	if c.Lookup != nil {
+		copy := *c.Lookup
+		c.Lookup = &copy
+	}
 	return c
 }
 
@@ -249,10 +262,20 @@ func (c callable) Call(ctx context.Context, arguments []byte) (any, error) {
 	if err != nil || len(encoded) > maxResultBytes {
 		return nil, runtime.ErrCapabilityUnsupported
 	}
+	if c.config.JSONTextResult {
+		return decodeJSONObject(encoded)
+	}
 	return result, nil
 }
 
 func (c callable) discover(ctx context.Context) (*agenttool.Declaration, error) {
+	if lookup := c.config.Lookup; lookup != nil {
+		set, _, err := c.openNamed(ctx, lookup.ToolName, lookup.ExpectedDeclarationDigest, lookup.KeyParameter)
+		if err != nil {
+			return nil, err
+		}
+		_ = set.Close()
+	}
 	set, remote, err := c.openExact(ctx)
 	if err != nil {
 		return nil, err
@@ -285,11 +308,15 @@ func (c callable) discover(ctx context.Context) (*agenttool.Declaration, error) 
 }
 
 func (c callable) openExact(ctx context.Context) (upstreamToolSet, agenttool.CallableTool, error) {
+	return c.openNamed(ctx, c.config.RemoteToolName, c.config.ExpectedDeclarationDigest, c.config.IdempotencyParameter)
+}
+
+func (c callable) openNamed(ctx context.Context, name, expected, keyParameter string) (upstreamToolSet, agenttool.CallableTool, error) {
 	if ctx == nil {
 		return nil, nil, runtime.ErrTenantScope
 	}
 	set := newUpstreamToolSet(upstreammcp.ConnectionConfig{Transport: c.config.Transport, ServerURL: c.config.ServerURL, Timeout: c.config.Timeout},
-		upstreammcp.WithToolFilterFunc(agenttool.NewIncludeToolNamesFilter(c.config.RemoteToolName)),
+		upstreammcp.WithToolFilterFunc(agenttool.NewIncludeToolNamesFilter(name)),
 		upstreammcp.WithMCPOptions(tmcp.WithHTTPReqHandler(safeHTTPHandler{})),
 		upstreammcp.WithMCPOptions(c.clientOptions()...))
 	if err := set.Init(ctx); err != nil {
@@ -297,7 +324,7 @@ func (c callable) openExact(ctx context.Context) (upstreamToolSet, agenttool.Cal
 		return nil, nil, fmt.Errorf("initialize MCP tool %q: %w", c.localID, err)
 	}
 	values := set.Tools(ctx)
-	if len(values) != 1 || values[0] == nil || values[0].Declaration() == nil || values[0].Declaration().Name != c.localID {
+	if len(values) != 1 || values[0] == nil || values[0].Declaration() == nil || values[0].Declaration().Name != name {
 		_ = set.Close()
 		return nil, nil, runtime.ErrVersionMismatch
 	}
@@ -308,11 +335,11 @@ func (c callable) openExact(ctx context.Context) (upstreamToolSet, agenttool.Cal
 	}
 	d := remote.Declaration()
 	digest, err := DeclarationDigest(d)
-	if err != nil || digest != c.config.ExpectedDeclarationDigest {
+	if err != nil || digest != expected {
 		_ = set.Close()
 		return nil, nil, runtime.ErrVersionMismatch
 	}
-	if p := c.config.IdempotencyParameter; p != "" && (d.InputSchema == nil || d.InputSchema.Properties[p] == nil || d.InputSchema.Properties[p].Type != "string") {
+	if p := keyParameter; p != "" && (d.InputSchema == nil || d.InputSchema.Properties[p] == nil || d.InputSchema.Properties[p].Type != "string") {
 		_ = set.Close()
 		return nil, nil, runtime.ErrVersionMismatch
 	}

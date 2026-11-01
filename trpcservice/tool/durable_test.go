@@ -91,6 +91,9 @@ type recoveringTool struct {
 func (t *recoveringTool) RecoveryPolicy() RecoveryPolicy { return t.policy }
 
 func (t *recoveringTool) TaskEvidenceCheck() *taskflow.ResultCheck {
+	if t.policy == RecoveryQueryable {
+		return &taskflow.ResultCheck{EqualsJSON: `"external-result"`}
+	}
 	return &taskflow.ResultCheck{EqualsJSON: `"ok"`}
 }
 func (t *recoveringTool) RecoveryKey(ctx context.Context) (string, error) {

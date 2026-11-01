@@ -21,7 +21,30 @@ CREATE TABLE public.execution_completion (
 
 PreparedRunGuard 的函数顺序为 PrepareFinalization（只读审核/计算）→ 持久化候选 → CommitFinalization（幂等 Settle + RecordDecision）→ 公开 PutResult → terminal/Outbox。恢复先查私有候选并交叉核对已有公开结果，无候选才读旧公开结果；SchemaVersion=2 还必须验证 PlanDigest（原输入、合同和完成步骤证据），SchemaVersion=1 仅提供旧合同兼容。候选必须核对 schema、输入摘要、完整 envelope、密钥版本、创建 Fence 不高于当前 Fence、原预约、输出摘要与审核决定的 tenant/request/policy。不得重新申请预约或重新价格计算。拒绝输出不能创建可投递的成功结果。自定义非 PreparedRunGuard 的实现须另行保证 Finish 的幂等性。
 
-MCP Config 新增 ReadOnly、IdempotencyParameter、CompletionCheck（Path/EqualsJSON/NonEmpty）三个代码审核配置：只读与幂等键互斥；幂等键要求合法远端 string 参数及非空有效 CompletionCheck。契约进入绑定摘要，声明验证在每次连接执行；提供商键由可信身份派生，模型输入不得携带保留参数。CompletionCheck 针对实际序列化结果，当前上游 MCP 常以 content 数组序列化，不能假定存在 status 对象字段或自动解析 text 内 JSON。未实现提供商查询协议时不得配置成 queryable。code_exec 使用 manual 恢复，只有真实成功执行可产生 status=completed；CompletionContract=1 进入其绑定摘要。
+MCP Config 的 ReadOnly、IdempotencyParameter、CompletionCheck 继续保留；新增 Lookup 和 JSONTextResult 可选契约。只读与幂等键互斥，Lookup 要求幂等写及非空 CompletionCheck。声明在构建和每次连接时验证，供应商键由可信身份派生，模型不能提供保留参数。JSONTextResult 默认 false，保持原 content 数组输出；设 true 后只接受业务对象或单个 text block 内的 JSON 对象，供 CompletionCheck 检查 status 等字段。新配置进入 BindingDigest，空新配置不改旧摘要。code_exec 仍使用 manual 恢复，未知副作用不能据查询缺失推断为可重放。
+
+### 工具查询优先的复刻契约
+
+本轮没有额外数据库迁移。RecoveryLookup 是原 idempotent_key 之上的可选读协议，不更改已保存的 policy/key；tenant 门面须同时转发 RecoveryLookupEnabled 与 LookupRecovery，不能因包装器自身有方法就假定底层支持。Guard 仅在 Attempt>1 或确认已消费后的恢复路径调用它；成功旧结果的复用不重新调用供应商。
+
+| LookupConfig 字段 | 类型 / 校验 | 含义 |
+|---|---|---|
+| ToolName | 合法工具名，不能等于写工具名 | 同一 endpoint 上审核过的只读操作。 |
+| ExpectedDeclarationDigest | 64 位小写 SHA-256 | 固定查询操作声明；构建与每次查询重查。 |
+| KeyParameter | 合法工具参数名，远端 schema 必须为 string | 查询时仅发送该参数，值为原 RecoveryKey。 |
+| JSONTextResult（主 Config） | bool，默认 false | 对写操作也启用单文本 JSON 对象解析；查询回执始终按固定协议解析。 |
+
+MCP 原业务键算法维持 SHA-256(tenant + NUL + request + NUL + localToolID + NUL + stableToolCallID + NUL + canonicalArgsDigest)。普通逻辑操作 ID 已含 tool version 和规范参数摘要，ask 使用持久确认调用 ID。查询仍使用原租户、原注册工具的凭据作用域，不让模型选择新 URL、查询名或业务键。
+
+查询回执格式示例（占位值不是真实结果）：
+
+```json
+{"operation_key":"<原业务键>","state":"completed","result":{"status":"created","record_id":"<原记录 ID>"}}
+```
+
+state 还可为 not_found/pending/failed/unknown。completed 要求非 null result，其余状态只允许 result 缺失或 null；未知字段、重复键、多个 text block、非 JSON 文本、MCP isError、操作键不一致均拒绝。最多 256 KiB，精确 JSON 数字保留 json.Number。not_found 仅允许原幂等键调用；pending/unknown/异常绝不降级为写入。failed 终结工具；已有通用 queryable 协议依然不能把“不确定”返回成 false。
+
+localnote.Reader.Lookup 查询 local_note 的 tenant_id/business_key，验证 request_id/args_digest，再以保存的 key_version 和 local-note-v1 AAD 解密。Create 使用 INSERT ON CONFLICT 返回原 ciphertext/nonce/key_version 并认证，完整 Result 必须与请求一致；不能仅检查元数据后回显入参。查询补回结果后仍走原 Complete、确认镜像与 RecordTool，不直接篡改任务计划为完成。当前未另存失败回执正文，失败状态与业务事实分别追溯。
 
 | 接口 | 必须实现的语义 |
 |---|---|
@@ -405,9 +428,38 @@ package tool
 
 import (
 	"context"
+	"errors"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 )
+
+var (
+	ErrRecoveryPending = errors.New("external operation is still pending")
+	ErrRecoveryFailed  = errors.New("external operation failed; do not replay")
+)
+
+type RecoveryState string
+
+const (
+	RecoveryCompleted RecoveryState = "completed"
+	RecoveryNotFound  RecoveryState = "not_found"
+	RecoveryPending   RecoveryState = "pending"
+	RecoveryFailed    RecoveryState = "failed"
+	RecoveryUnknown   RecoveryState = "unknown"
+)
+
+type RecoveryResult struct {
+	State  RecoveryState
+	Result any
+}
+
+// RecoveryLookup adds an optional read-before-replay to idempotent tools.
+// It does not grant replay permission: not_found still requires the SAME
+// provider idempotency key, because an old request may arrive after the lookup.
+type RecoveryLookup interface {
+	RecoveryLookupEnabled() bool
+	LookupRecovery(context.Context, string) (RecoveryResult, error)
+}
 
 // RecoveryPolicy declares what a new owner may safely do after a tool lease
 // expires while the previous owner was executing an external operation.

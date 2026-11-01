@@ -4,6 +4,8 @@
 
 ## 当前实现状态
 
+工具侧已增加 idempotent_key 的查询优先恢复：实际 local_note 从业务表认证原结果并修复检查点，MCP 可配置审核后的同端点状态查询和 JSON 文本回执解析；可信完成断言在成功入账前及结果复用时执行。详见[工具状态与协议](inflight-task-takeover/design.md#状态查询优先与可信回执前置校验)。本轮无新增数据库迁移，未知写操作与代码执行中断仍保守处理。
+
 `000007_execution_completion` 补齐治理结算与结果提交之间的恢复窗口：先保存加密的完成候选及已审核决定，再幂等结算、晋升公开结果并提交终态。接管交叉验证候选、计划和公开结果，不重新申请已关闭预约；矛盾状态保留证据并失败收敛。会话读取视图按原 request/Fence 整理当前尝试，并按权威终态重建过去最多 100 轮原输入/最终结果；MCP 与代码执行适配器补充明确的恢复/完成证据契约。字段与边界见[完成候选设计](inflight-task-takeover/design.md#000007完成候选与治理结算恢复)。部署迁移需执行至 000007。
 
 步骤级恢复由 `000005_task_checkpoints` 与 `000006_task_failure_convergence` 提供。当前本地 WebUI/WeCom 共享组合根启用加密计划、版本化检查点、强制非空计划准入、工具操作与证据绑定、持久化有界重试，以及成功/失败终态的可靠投递。详见[步骤数据模型](inflight-task-takeover/design.md)与[运行顺序](inflight-task-takeover/implementation-walkthrough.md)。自定义 RunnerExecutor/Factory 调用者需要同时装配对应 Store 和工具开关，不能仅执行迁移就声称所有运行入口启用。启用 TaskPlans 的普通纯文本请求也须创建计划，不能以空计划绕过完成门禁。

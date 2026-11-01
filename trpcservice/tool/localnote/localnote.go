@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 
@@ -61,7 +62,38 @@ type Note struct {
 type Writer interface {
 	Create(context.Context, Note) (Result, error)
 }
+type LookupKey struct{ TenantID, RequestID, BusinessKey, ArgsDigest string }
+type Reader interface {
+	Lookup(context.Context, LookupKey) (Result, error)
+}
 type Tool struct{ Writer Writer }
+
+func (t Tool) RecoveryLookupEnabled() bool { _, ok := t.Writer.(Reader); return ok }
+func (t Tool) LookupRecovery(ctx context.Context, key string) (servicetool.RecoveryResult, error) {
+	expected, err := t.RecoveryKey(ctx)
+	if err != nil {
+		return servicetool.RecoveryResult{}, err
+	}
+	if key != expected {
+		return servicetool.RecoveryResult{}, runtime.ErrVersionMismatch
+	}
+	e, _ := runtime.ExecutionContextFrom(ctx)
+	reader, ok := t.Writer.(Reader)
+	if !ok {
+		return servicetool.RecoveryResult{}, runtime.ErrCapabilityUnsupported
+	}
+	r, err := reader.Lookup(ctx, LookupKey{TenantID: e.TenantID, RequestID: e.RequestID, BusinessKey: key, ArgsDigest: e.ArgsDigest})
+	if errors.Is(err, runtime.ErrNotFound) {
+		return servicetool.RecoveryResult{State: servicetool.RecoveryNotFound}, nil
+	}
+	if err != nil {
+		return servicetool.RecoveryResult{}, err
+	}
+	if r.Status != "created" || r.NoteID != "note_"+key[:24] {
+		return servicetool.RecoveryResult{}, runtime.ErrVersionMismatch
+	}
+	return servicetool.RecoveryResult{State: servicetool.RecoveryCompleted, Result: r}, nil
+}
 
 func (Tool) TaskEvidenceCheck() *taskflow.ResultCheck {
 	return &taskflow.ResultCheck{Path: []string{"status"}, EqualsJSON: `"created"`}
@@ -71,7 +103,7 @@ func (Tool) RecoveryPolicy() servicetool.RecoveryPolicy { return servicetool.Rec
 
 func (Tool) RecoveryKey(ctx context.Context) (string, error) {
 	execution, ok := servicetool.RecoveryContext(ctx)
-	if !ok || execution.ToolCallID == "" || execution.ArgsDigest == "" {
+	if !ok || execution.TenantID == "" || execution.RequestID == "" || execution.ToolCallID == "" || execution.ArgsDigest == "" {
 		return "", runtime.ErrTenantScope
 	}
 	sum := sha256.Sum256([]byte(execution.TenantID + "\x00" + execution.RequestID + "\x00" + execution.ToolCallID + "\x00" + execution.ArgsDigest))
@@ -130,8 +162,15 @@ func (t Tool) Call(ctx context.Context, arguments []byte) (any, error) {
 	if t.Writer == nil {
 		return nil, runtime.ErrCapabilityUnsupported
 	}
-	return t.Writer.Create(ctx, Note{TenantID: execution.TenantID, RequestID: execution.RequestID, BusinessKey: recoveryKey, ArgsDigest: digest, KeyVersion: execution.PayloadKeyVersion,
-		Result: Result{Status: "created", NoteID: "note_" + recoveryKey[:24], Title: value.Title, Content: value.Content}})
+	expected := Result{Status: "created", NoteID: "note_" + recoveryKey[:24], Title: value.Title, Content: value.Content}
+	result, err := t.Writer.Create(ctx, Note{TenantID: execution.TenantID, RequestID: execution.RequestID, BusinessKey: recoveryKey, ArgsDigest: digest, KeyVersion: execution.PayloadKeyVersion, Result: expected})
+	if err != nil {
+		return nil, err
+	}
+	if result != expected {
+		return nil, runtime.ErrVersionMismatch
+	}
+	return result, nil
 }
 
 var _ agenttool.CallableTool = Tool{}

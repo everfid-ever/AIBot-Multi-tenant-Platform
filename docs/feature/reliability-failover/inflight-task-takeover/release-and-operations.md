@@ -1,5 +1,11 @@
 # 在途任务接管与幂等投递 — 发布与运维
 
+## 工具状态查询的发布和排障
+
+本轮无新增表，仍需 000007。local_note 的 policy/key 保持原值，PG Writer 新增认证查询与同键结果读取；旧密钥版本必须保留，否则不得把查询/幂等 Create 的解密错误当作成功。MCP 启用 Lookup 或 JSONTextResult 会改变绑定摘要，须按不可变版本发布工具及 Agent revision；默认不启用者保持原输出/摘要。
+
+recovery_pending/recovery_unknown/recovery_lookup_error 表示原操作待确认，禁止手工换业务键或删工具行来触发新写。external_operation_failed/tool_receipt_rejected 是失败而非“无副作用”；按原业务键查业务事实和凭证。pending 仍受任务预算约束，耗尽后的安全停止不代表操作回滚。只有实际供应商满足配置的幂等与只读查询契约，才能使用 MCP 查询优先；仅把某工具命名为 lookup 不构成只读保证。
+
 ## 完成候选版本与恢复矛盾处置
 
 本轮未新增迁移，数据库仍需 000007。新候选 JSON 写 SchemaVersion=2/PlanDigest，能读取旧 SchemaVersion=1；只认识版本 1 的旧 Worker 不能处理新候选，未清空在途记录前不要回滚旧应用或混跑为兼容方案。自定义 AtomicSessionStore 还要实现 TerminalHistoryReader；缺少接口时 Worker 在启动新模型运行前拒绝降级。
