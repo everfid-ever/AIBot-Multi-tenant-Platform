@@ -2,12 +2,29 @@
 
 ## 重试历史的读取视图
 
+当前 Worker 使用两层视图：ConfigureHistory 整理**当前请求**的旧尝试和批准调用；ConfigureCommittedHistory 则按 **session_commit 权威终态**重建过去轮次。后者优先于最高 Fence 推断，因为高 Fence 草稿也可能未提交、被取消或在答案审核时被拒绝。直接使用 BufferedTurn 而不配置终态快照的调用方仍只有基础过滤，不具备 Worker 的终态投影保证。
+
+`TerminalHistoryReader.ListTerminalHistory` 按 tenant/app/session、input_seq < 当前输入查询最近最多 100 个 terminal，再按 input_seq 正序返回。复用现有 session_commit 的 request_id、commit_id、input_seq、fence、outcome、result_ref、created_at，不新增聊天表。Worker 逐条核对原 execution envelope 的租户、应用、会话、用户和序号；成功轮从原 payload 解码输入并按原请求验证/加载附件，从精确 result_ref 读取并验证最终输出。即使接管提交的 Fence 高于生成答案的 Fence，也使用终态指向的原答案。
+
+| 过去轮次的权威终态 | 后续模型读取内容 | 排除的错误推断 |
+|---|---|---|
+| succeeded | 原始成功输入 + terminal.result_ref 指定且摘要/密钥版本有效的最终结果 | 不使用最新草稿、未渲染模型文本或迟到的高 Fence 回复。 |
+| failed 且有 result_ref | 精确提交的安全失败文本；不重新加载原输入 | 不能把失败前的成功草稿当作答案；失败不证明副作用回滚。 |
+| failed 无结果、denied、cancelled、confirmation_denied/timeout | 明确标记“服务端执行状态”的内部上下文消息 | 不声称已回复用户；不带入可能未通过输入审核的正文。 |
+| 非 terminal、未知旧请求、窗口以外历史 | 不作为过去完成轮次投影 | 未提交 SDK 事件不能成为成功证明；默认不是无限历史回忆。 |
+
+过去的工具草稿、推理和调用事件不直接进入终态投影，原始 SDK 记录仍可追溯；同一在途任务的步骤、工具结果和批准确认调用继续由现有恢复机制提供。本轮实时事件保留。合成事件具有稳定 terminal/commit 坐标，仅存在于读取副本，不回写 SDK。assistant 作者留空以避免 SDK 将其转换为“其他 Agent 的用户消息”；user 保留正确角色。
+
+读取副本清空 Tracks/Summaries，避免缓存重新注入被排除事件；不删除原事件或 SDK State，也没有实现任意状态写入的事务回滚。读取或身份/摘要校验失败时停止构建本轮模型输入，不能降级为空历史。最近 100 轮与模型上下文容量是实际边界，投影中的 committed 也不等于渠道已送达。
+
+### 基础事件过滤（用于当前轮及独立门面兼容）
+
 `storage/session/history.go` 在官方 SDK 历史外提供读取整理，不另建聊天事实表。Worker 调用 ConfigureHistory，把原 request、当前 Fence 和适用的已批准 ToolCallID 绑定到本轮；AppendEvent 用可信扩展 `trpc.execution.v1={request_id,fence}` 覆盖调用者传入的同名元数据，保留原事件 ID。SDK Clone 会生成新 ID，因此整理副本时显式恢复原 ID。
 
 | 读到的事件 | 读取策略 | 为什么 |
 |---|---|---|
 | 当前原请求的旧 Fence | 新运行默认省略 | 原输入由 Worker 重新提供，避免重复输入及旧半成品被当作本次回答。 |
-| 已完成其他请求的多个 Fence | 保留最高已观测 Fence，重复 Event.ID 只取一次 | 迟到的旧 owner 不能覆盖较新尝试；不同 request 即使文本相同也不能合并。 |
+| 基础过滤中的其他请求多个 Fence | 取最高已观测 Fence，重复 Event.ID 只取一次；Worker 随后用终态投影替换过去事件 | 基础过滤不是成功证明，不同 request 即使文本相同也不能合并。 |
 | 其他请求孤立的 tool call/result | 按 request/Fence/invocation/branch/工具 ID 与名称配对后过滤 | 避免模型收到无对应调用的工具消息。 |
 | 本轮正在执行的 call | 保留 | 工具结果可能尚未产生，不能误删正常进行中的调用。 |
 | 确认恢复 | 保留原输入及确切批准的 call，其余旧尝试事件省略 | 继续原授权调用，不能把其他 call 一并恢复。 |

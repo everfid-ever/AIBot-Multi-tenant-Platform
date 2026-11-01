@@ -4,7 +4,7 @@
 
 1. Runner 核对原 envelope、顺序和 payload 后调用 taskflow Store.Open，以原输入 SHA-256、payload key version 和会话 fence 创建或接管计划。Redis 提交前检查也用于计划写入前资格检查。
 2. Recover 遍历已绑定工具步骤，读取同 tenant/request/tool-call 的工具账本。成功结果须通过工具名/版本、参数摘要、密文摘要、必需的步骤断言及适用的服务端可信断言；成功结果存在但检查点尚未提交时补齐步骤成功。不可恢复 failed/manual 未知先保存失败，停止模型重跑。
-3. 有冻结答案时继续已有结果分支；否则先查 execution_completion，存在时恢复原结算并晋升结果，跳过新模型运行。两者都没有时，将 checkpoint 作为数据加入本轮 global instruction，保留原发布 instruction。已完成工具结果小于等于 8192 字节时内联，大结果使用 read_result 按 UTF-8 字节分块读取。原用户输入保持权威。
+3. 先查 execution_completion，存在时验证 PlanDigest、原治理决定、用量及适用的已冻结结果，恢复原结算并晋升/续提交，跳过新模型运行。无候选时才读取旧冻结答案；两者都没有且计划未 sealed 时，将 checkpoint 作为数据加入本轮 global instruction，保留原发布 instruction。已完成工具结果小于等于 8192 字节时内联，大结果使用 read_result 按 UTF-8 字节分块读取。原用户输入保持权威。
 4. Factory 添加代码自有 task_checkpoint 工具；Worker 仅对这个精确类型放行控制权限，名称被保留，租户工具不能冒名。工具动作有预算限制、上下文租户检查、长度限制、版本检查和写前资格检查。
 5. 模型通过 define/start/complete_analysis/inspect/read_result 管理步骤。define 只追加；普通工具在实际调用前由 GuardedCallable 将稳定操作与规范参数写入运行步骤，然后才走原工具 claim/恢复/授权协议。
 6. 工具成功结果提交后 RecordTool 再核对并更新计划。此处被杀时，下一 owner 的 Recover 从工具结果修复检查点；工具效果完成但结果未落库时，继续依赖原工具恢复策略。
@@ -94,7 +94,7 @@
 
 ## 冻结答案与 terminal 提交
 
-Runner 先加载并校验原输入。若 Results.GetResult 找到同 tenant/request 的冻结结果，要求 result_ref 非空、key version 与 payload 一致、内容摘要匹配，随后进入 commitFrozenSuccess。没有公开结果时先查询私有 execution_completion：候选存在则复用原审核决定、幂等结算并保存公开结果；两者都不存在才执行模型。生成结束先保存候选，再结算、PutResult，最后经过 result-before-commit 暂停点后提交。commitFrozenSuccess 重查取消意图、beforeCommit 与 terminal 条件，原子写 terminal 和 reply Outbox。
+Runner 先加载并校验原输入及计划，recoverCompletion 优先查询私有 execution_completion；存在时校验原审核决定、分模型用量、PlanDigest，并交叉核对已有公开结果的引用/字节/格式/密钥，再续提交。没有候选时才读取旧冻结结果兼容记录；两者都不存在且计划未 sealed 才允许模型运行。矛盾事实进入恢复失败终态，临时依赖错误保留重试。生成结束先保存候选，再结算、PutResult，最后经过 result-before-commit 暂停点后提交。commitFrozenSuccess 重查取消意图、beforeCommit 与 terminal 条件，原子写 terminal 和 reply Outbox。
 
 SDK 事件已同步持久，续提交不会再运行 SDK。result_payload 独立于 terminal 事务，所以这是专门的恢复分支，不能把它误写成“提交前一律重跑”。
 

@@ -270,47 +270,27 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 			return err
 		}
 		task := &taskflow.Session{Store: w.TaskPlans, Tools: w.ToolExecutions, Results: results, Scope: scope, BeforeWrite: beforeCommit}
+		ctx = taskflow.WithSession(ctx, task)
 		if _, err := task.Recover(ctx); err != nil {
 			if reason := taskflow.StopReason(err); reason != "" {
+				if recoveryReason(reason) {
+					return w.commitRecoveryFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, reason)
+				}
 				return w.commitTaskFailure(ctx, task, turn, envelope, head, fence, beforeCommit, modelRef, payload.KeyVersion, reason)
 			}
 			return err
 		}
 		ctx = taskflow.WithSession(ctx, task)
 	}
-	// A process can die after freezing its output but before committing the
-	// terminal/outbox transaction. SDK history is already durable at this
-	// stage; reuse the output instead of generating a conflicting second one.
-	if results, ok := w.Payloads.(messaging.ResultStore); ok {
-		frozen, readErr := results.GetResult(ctx, envelope.TenantID, envelope.RequestID)
-		if readErr == nil {
-			sum := sha256.Sum256(frozen.Content)
-			if frozen.TenantID != envelope.TenantID || frozen.RequestID != envelope.RequestID || frozen.ResultRef == "" || frozen.KeyVersion != payload.KeyVersion || frozen.ContentDigest != hex.EncodeToString(sum[:]) {
-				return runtime.ErrVersionMismatch
-			}
-			err = w.commitFrozenSuccess(ctx, turn, envelope, head, fence, beforeCommit, frozen.ResultRef)
-			if err == nil {
-				committed = true
-			}
-			return err
-		}
-		if !errors.Is(readErr, runtime.ErrNotFound) {
-			return readErr
-		}
+	if handled, recoveryErr := w.recoverCompletion(ctx, turn, envelope, head, fence, beforeCommit, payload, modelRef); handled {
+		committed = recoveryErr == nil
+		return recoveryErr
 	}
-	if store := w.completionStore(); store != nil {
-		record, readErr := store.GetCompletion(ctx, envelope.TenantID, envelope.RequestID)
-		if readErr == nil {
-			err = w.resumeCompletion(ctx, turn, envelope, head, fence, beforeCommit, payload, record)
-			if err == nil {
-				committed = true
-			}
-			return err
-		}
-		if !errors.Is(readErr, runtime.ErrNotFound) {
-			return readErr
-		}
+	history, err := w.committedHistory(ctx, envelope)
+	if err != nil {
+		return fmt.Errorf("resolve committed conversation history: %w", err)
 	}
+	turn.ConfigureCommittedHistory(history)
 	if task := taskflow.FromContext(ctx); task != nil {
 		if _, err := task.BeginAttempt(ctx); err != nil {
 			if reason := taskflow.StopReason(err); reason != "" {
@@ -341,6 +321,9 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 			return fmt.Errorf("begin governance run: %w", err)
 		}
 		if permit.Decision.Action != governance.ActionAllow {
+			if permit.Decision.ReasonCode == governance.ReasonReservationClosed {
+				return w.commitRecoveryFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, "closed_reservation_without_completion")
+			}
 			return w.commitGovernanceTerminal(ctx, turn, envelope, head, fence, beforeCommit, runtime.OutcomeDenied, permit.Decision)
 		}
 		if validator, ok := w.Governance.(governance.ModelCandidateGuard); ok {
@@ -760,9 +743,15 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	}
 	record, err := w.saveCompletion(ctx, envelope, fence, beforeCommit, payload, permit, runResult, outbound)
 	if err != nil {
+		if completionConflict(err) {
+			return w.commitRecoveryFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, "completion_conflict")
+		}
 		return err
 	}
 	err = w.resumeCompletion(ctx, turn, envelope, head, fence, beforeCommit, payload, record)
+	if completionConflict(err) {
+		return w.commitRecoveryFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, "completion_conflict")
+	}
 	if err == nil {
 		committed = true
 	}

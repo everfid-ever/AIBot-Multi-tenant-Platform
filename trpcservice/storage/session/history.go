@@ -189,5 +189,45 @@ func (t *BufferedTurn) historyView(raw *agentsession.Session) *agentsession.Sess
 	// alternate history sources in the view; persistent SDK state is untouched.
 	v.Tracks = nil
 	v.Summaries = nil
+	v = t.projectCommittedHistory(v, s)
+	return v
+}
+
+func (t *BufferedTurn) projectCommittedHistory(v *agentsession.Session, scope historyScope) *agentsession.Session {
+	t.mu.Lock()
+	enabled := t.authoritativeHistory
+	turns := append([]CommittedHistoryTurn(nil), t.committedHistory...)
+	t.mu.Unlock()
+	if !enabled {
+		return v
+	}
+	// Past SDK events (including unknown legacy roots) are audit facts, not
+	// evidence that a draft was committed. Only the current attempt/approved
+	// continuation remains live; every past turn comes from terminal truth.
+	var current []agentevent.Event
+	for i := range v.Events {
+		if eventScope(&v.Events[i]).RequestID == scope.RequestID {
+			current = append(current, v.Events[i])
+		}
+	}
+	v.Events = nil
+	for _, turn := range turns {
+		appendMessage := func(kind string, m model.Message) {
+			stamp, _ := json.Marshal(historyScope{RequestID: turn.RequestID, Fence: turn.Fence})
+			terminal, _ := json.Marshal(turn.TerminalHistory)
+			author := ""
+			if kind == "user" {
+				author = "user"
+			}
+			response := (&model.Response{Done: true, Choices: []model.Choice{{Message: m}}}).Clone()
+			v.Events = append(v.Events, agentevent.Event{ID: "terminal:" + turn.CommitID + ":" + kind, RequestID: turn.RequestID, InvocationID: "terminal:" + turn.CommitID, Author: author, Timestamp: turn.CommittedAt,
+				Response: response, Extensions: map[string]json.RawMessage{historyExtension: stamp, "trpc.terminal.v1": terminal}})
+		}
+		if turn.Input != nil {
+			appendMessage("user", *turn.Input)
+		}
+		appendMessage("assistant", turn.Answer)
+	}
+	v.Events = append(v.Events, current...)
 	return v
 }

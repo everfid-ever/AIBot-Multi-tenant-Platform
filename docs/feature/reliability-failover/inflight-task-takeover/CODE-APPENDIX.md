@@ -1,5 +1,131 @@
 # 在途任务接管与幂等投递 — 实现代码附录
 
+## 恢复判定与异常收敛
+
+来源：`trpcservice/worker/recovery.go`，完整文件。候选优先交叉校验，恢复矛盾以原请求 failed/audit 结束并保留证据；普通依赖失败返回原阶段重试。对应 recovery_state_test.go。
+
+```go
+package worker
+
+import (
+	"context"
+	"errors"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+	sessionstore "github.com/liuzengh/trpc-agent-service/trpcservice/storage/session"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
+)
+
+func completionConflict(err error) bool {
+	return errors.Is(err, governance.ErrFinalizationConflict) || errors.Is(err, runtime.ErrVersionMismatch) || errors.Is(err, runtime.ErrInvariantViolation) || errors.Is(err, runtime.ErrIdempotencyCollision) || errors.Is(err, runtime.ErrInvalidEnvelope) || errors.Is(err, taskflow.ErrIncomplete) || errors.Is(err, taskflow.ErrEvidenceRejected) || errors.Is(err, taskflow.ErrEvidenceRequired)
+}
+
+func recoveryReason(reason string) bool {
+	switch reason {
+	case "completion_conflict", "legacy_result_conflict", "sealed_result_missing", "closed_reservation_without_completion":
+		return true
+	}
+	return false
+}
+
+func (w RunnerExecutor) recoverCompletion(ctx context.Context, turn *sessionstore.BufferedTurn, e runtime.ExecutionEnvelope, head sessionstore.SessionHead, fence uint64, before func(context.Context) error, payload messaging.PayloadRecord, modelRef governance.VersionedRef) (bool, error) {
+	store := w.completionStore()
+	if store == nil {
+		return true, runtime.ErrCapabilityUnsupported
+	}
+	// Candidates carry approval and plan evidence; the presence of a public
+	// payload is not permission to skip validating that evidence.
+	r, err := store.GetCompletion(ctx, e.TenantID, e.RequestID)
+	if err == nil {
+		err = w.resumeCompletion(ctx, turn, e, head, fence, before, payload, r)
+		if completionConflict(err) {
+			err = w.commitRecoveryFailure(ctx, turn, e, head, fence, before, modelRef, "completion_conflict")
+		}
+		return true, err
+	}
+	if !errors.Is(err, runtime.ErrNotFound) {
+		if completionConflict(err) {
+			return true, w.commitRecoveryFailure(ctx, turn, e, head, fence, before, modelRef, "completion_conflict")
+		}
+		return true, err
+	}
+	results, ok := w.Payloads.(messaging.ResultStore)
+	if !ok {
+		return true, runtime.ErrCapabilityUnsupported
+	}
+	frozen, err := results.GetResult(ctx, e.TenantID, e.RequestID)
+	if err == nil {
+		if err = validateFrozenResult(frozen, e); err == nil && frozen.KeyVersion != payload.KeyVersion {
+			err = runtime.ErrVersionMismatch
+		}
+		if err == nil {
+			err = w.commitFrozenSuccess(ctx, turn, e, head, fence, before, frozen.ResultRef)
+		}
+		if completionConflict(err) {
+			err = w.commitRecoveryFailure(ctx, turn, e, head, fence, before, modelRef, "legacy_result_conflict")
+		}
+		return true, err
+	}
+	if !errors.Is(err, runtime.ErrNotFound) {
+		if completionConflict(err) {
+			return true, w.commitRecoveryFailure(ctx, turn, e, head, fence, before, modelRef, "legacy_result_conflict")
+		}
+		return true, err
+	}
+	if task := taskflow.FromContext(ctx); task != nil {
+		p, err := task.Store.Get(ctx, task.Scope.Key)
+		if err != nil {
+			return true, err
+		}
+		if p.Phase == "sealed" {
+			return true, w.commitRecoveryFailure(ctx, turn, e, head, fence, before, modelRef, "sealed_result_missing")
+		}
+	}
+	return false, nil
+}
+
+// Contradictory immutable evidence is not repairable by generating another
+// answer. Preserve the records, record a failed terminal, and advance the gate.
+// No suspect result is referenced by a reply Outbox or exposed as history.
+func (w RunnerExecutor) commitRecoveryFailure(ctx context.Context, turn *sessionstore.BufferedTurn, e runtime.ExecutionEnvelope, head sessionstore.SessionHead, fence uint64, before func(context.Context) error, modelRef governance.VersionedRef, reason string) error {
+	if before != nil {
+		if err := before(ctx); err != nil {
+			return err
+		}
+	}
+	if task := taskflow.FromContext(ctx); task != nil {
+		if _, err := task.Fail(ctx, reason); err != nil {
+			return err
+		}
+	}
+	if w.Governance != nil {
+		if err := w.Governance.Abort(ctx, e, modelRef, reason); err != nil && !errors.Is(err, runtime.ErrNotFound) {
+			return err
+		}
+		d := governance.Decision{DecisionID: governance.StableDecisionID(e.TenantID, e.RequestID, "recovery", e.PolicyVersion), TenantID: e.TenantID, RequestID: e.RequestID, Stage: "recovery", Action: governance.ActionDeny, ReasonCode: reason, PolicyVersion: e.PolicyVersion}
+		if err := w.Governance.Record(ctx, d); err != nil {
+			return err
+		}
+	}
+	if turn != nil {
+		_ = turn.Rollback(ctx)
+	}
+	if before != nil {
+		if err := before(ctx); err != nil {
+			return err
+		}
+	}
+	_, err := w.Sessions.CommitTurn(ctx, sessionstore.CommitTurnRequest{SessionKey: head.SessionKey, RequestID: e.RequestID, CommitID: e.RequestID + ":recovery:" + reason, Stage: "terminal", InputSeq: e.InputSeq, Fence: fence, ExpectedVersion: head.Version, Outcome: runtime.OutcomeFailed, Outbox: []sessionstore.OutboxEvent{terminalAuditOutbox(ctx, e, runtime.OutcomeFailed)}})
+	if errors.Is(err, runtime.ErrAlreadyTerminal) {
+		return nil
+	}
+	return err
+}
+```
+
+
 ## 完成候选的实际保存与恢复代码
 
 来源：`trpcservice/worker/completion.go`，完整文件。saveCompletion 在任何结算写入前保存候选，resumeCompletion 校验作用域后重放原治理决定；只允许审核通过的内容晋升公开结果。候选密文的字段及 AAD 见 [设计](design.md#000007完成候选与治理结算恢复)。
@@ -8,8 +134,10 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
@@ -28,6 +156,7 @@ type completionCandidate struct {
 	Prepared      *governance.Finalization
 	Usage         []governance.ModelUsage
 	Output        OutboundContent
+	PlanDigest    string
 }
 
 func (w RunnerExecutor) completionStore() messaging.CompletionStore {
@@ -46,7 +175,14 @@ func (w RunnerExecutor) saveCompletion(ctx context.Context, e runtime.ExecutionE
 	if s == nil {
 		return messaging.CompletionRecord{}, runtime.ErrCapabilityUnsupported
 	}
-	c := completionCandidate{SchemaVersion: 1, Envelope: e, InputDigest: taskflow.Digest(payload.Content), Usage: runnerModelUsages(permit.Model, result), Output: out}
+	c := completionCandidate{SchemaVersion: 2, Envelope: e, InputDigest: taskflow.Digest(payload.Content), Usage: runnerModelUsages(permit.Model, result), Output: out}
+	if task := taskflow.FromContext(ctx); task != nil {
+		p, err := task.ValidateCompletion(ctx)
+		if err != nil {
+			return messaging.CompletionRecord{}, err
+		}
+		c.PlanDigest = completionPlanDigest(p)
+	}
 	if w.Governance != nil {
 		c.Permit = &permit
 		if guard, ok := w.Governance.(governance.PreparedRunGuard); ok {
@@ -76,21 +212,46 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 	if err := r.Validate(); err != nil {
 		return err
 	}
-	if r.TenantID != e.TenantID || r.RequestID != e.RequestID || r.KeyVersion != payload.KeyVersion || r.EnvelopeDigest != envelopeDigest(e) || r.Fence > fence {
+	if r.TenantID != e.TenantID || r.RequestID != e.RequestID || r.KeyVersion != payload.KeyVersion || r.Fence > fence {
 		return runtime.ErrVersionMismatch
 	}
 	var c completionCandidate
 	if err := json.Unmarshal(r.Content, &c); err != nil {
 		return runtime.ErrInvariantViolation
 	}
-	contentType, typeErr := messaging.NormalizeContentType(c.Output.ContentType)
-	if c.SchemaVersion != 1 || c.InputDigest != taskflow.Digest(payload.Content) || verifyAuthoritativeEnvelope(c.Envelope, e) != nil || len(c.Output.Content) == 0 || typeErr != nil || contentType != c.Output.ContentType {
+	validated, typeErr := validateOutbound(c.Output)
+	if (c.SchemaVersion != 1 && c.SchemaVersion != 2) || r.EnvelopeDigest != envelopeDigest(c.Envelope) || c.InputDigest != taskflow.Digest(payload.Content) || verifyAuthoritativeEnvelope(c.Envelope, e) != nil || typeErr != nil || validated.ContentType != c.Output.ContentType {
 		return runtime.ErrVersionMismatch
 	}
 	if task := taskflow.FromContext(ctx); task != nil {
-		if _, err := task.ValidateCompletion(ctx); err != nil {
+		p, err := task.ValidateCompletion(ctx)
+		if err != nil {
 			return err
 		}
+		if c.SchemaVersion == 2 && c.PlanDigest != completionPlanDigest(p) {
+			return runtime.ErrVersionMismatch
+		}
+	} else if c.SchemaVersion == 2 && c.PlanDigest != "" {
+		return runtime.ErrVersionMismatch
+	}
+	ref, err := encodeResultRef(ctx, w.EncodeResult, e, string(c.Output.Content))
+	if err != nil {
+		return err
+	}
+	results, ok := w.Payloads.(messaging.ResultStore)
+	if !ok {
+		return runtime.ErrCapabilityUnsupported
+	}
+	frozen, frozenErr := results.GetResult(ctx, e.TenantID, e.RequestID)
+	if frozenErr == nil {
+		if err = validateFrozenResult(frozen, e); err != nil {
+			return err
+		}
+		if frozen.KeyVersion != payload.KeyVersion || frozen.ResultRef != ref || frozen.ContentType != c.Output.ContentType || !bytes.Equal(frozen.Content, c.Output.Content) {
+			return runtime.ErrIdempotencyCollision
+		}
+	} else if !errors.Is(frozenErr, runtime.ErrNotFound) {
+		return frozenErr
 	}
 	latest, err := w.Tasks.GetExecution(ctx, gateway.ExecutionKey{TenantID: e.TenantID, RequestID: e.RequestID})
 	if err != nil {
@@ -116,6 +277,12 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 			guard, ok := w.Governance.(governance.PreparedRunGuard)
 			if !ok || c.Prepared.OutputDigest != taskflow.Digest(c.Output.Content) || c.Prepared.Decision.TenantID != e.TenantID || c.Prepared.Decision.RequestID != e.RequestID || c.Prepared.Decision.PolicyVersion != e.PolicyVersion || c.Prepared.Decision.ReservationID != c.Permit.Reservation.ReservationID || c.Prepared.Settlement.ExpectedVersion != c.Permit.Reservation.Version {
 				return runtime.ErrVersionMismatch
+			}
+			if err = c.Prepared.Validate(*c.Permit, c.Usage, c.Output.Content); err != nil {
+				return err
+			}
+			if frozenErr == nil && c.Prepared.Decision.Action != governance.ActionAllow {
+				return runtime.ErrInvariantViolation
 			}
 			decision, err = guard.CommitFinalization(ctx, *c.Prepared)
 		} else {
@@ -147,14 +314,6 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 			return err
 		}
 	}
-	ref, err := encodeResultRef(ctx, w.EncodeResult, e, string(c.Output.Content))
-	if err != nil {
-		return err
-	}
-	results, ok := w.Payloads.(messaging.ResultStore)
-	if !ok {
-		return runtime.ErrCapabilityUnsupported
-	}
 	if err = results.PutResult(ctx, messaging.ResultRecord{TenantID: e.TenantID, RequestID: e.RequestID, ResultRef: ref, ContentDigest: taskflow.Digest(c.Output.Content), Content: c.Output.Content, ContentType: c.Output.ContentType, KeyVersion: payload.KeyVersion}); err != nil {
 		return err
 	}
@@ -164,6 +323,17 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 		}
 	}
 	return w.commitFrozenSuccess(ctx, turn, e, head, fence, before, ref)
+}
+
+// Fence/version/phase change during adoption/sealing; declared obligations and
+// their evidence must remain identical to those reviewed with this candidate.
+func completionPlanDigest(p taskflow.Plan) string {
+	b, _ := json.Marshal(struct {
+		InputDigest string
+		Contract    taskflow.Contract
+		Steps       []taskflow.Step
+	}{p.InputDigest, p.Contract, p.Steps})
+	return taskflow.Digest(b)
 }
 ```
 

@@ -2,6 +2,29 @@
 
 ## 000007：完成候选与治理结算恢复
 
+### 当前恢复状态判定与 SchemaVersion=2
+
+新候选写 SchemaVersion=2，在既有加密 JSON 中增加 PlanDigest，绑定原输入、准入合同、步骤与完成证据；不绑定接管时会变化的 Fence、版本计数和封存 phase。新 owner 重新校验计划后，摘要必须与审核答案时相同；启用/关闭 TaskPlans 不能让新候选绕过这一绑定。SchemaVersion=1 旧候选可兼容读取并继续校验原作用域/计划，但没有新增摘要约束。
+
+恢复顺序调整为：**候选存在先验证候选，并交叉核对任何公开结果**；无候选才走旧版冻结结果兼容分支；两者均不存在且计划未封存才允许新模型运行。公开结果存在不再跳过治理和候选校验。完整 envelope 的时间用相等时刻核对，候选 envelope_digest 按其保存的 envelope 校验，避免 JSON/数据库时区表示差异误拒绝合法接管。
+
+| 观测状态 | 当前动作 | 是否重跑模型 / 是否发送 |
+|---|---|---|
+| 候选完整、公开结果缺失 | 验证计划证据和原审核/用量后续结算、晋升、Seal、terminal | 不重跑；按原终态发出。 |
+| 候选和公开结果均存在且一致 | 核对内容类型、字节、引用、密钥及原批准决定，幂等续提交 | 不重跑；仍只沿原 reply 坐标。 |
+| 候选与公开结果矛盾、PlanDigest 改变、候选损坏或旧结果校验失败 | 保留不可变证据，提交 failed、记录恢复原因和终态 audit | 不重跑；不为可疑结果创建 reply。 |
+| 计划 sealed，但候选和公开结果均缺失 | sealed_result_missing 失败收敛 | 不凭原输入重新创造另一个答案。 |
+| 预约关闭、候选与公开结果均缺失 | closed_reservation_without_completion 失败收敛 | 不将恢复矛盾误标为普通输入拒绝。 |
+| 候选中的预约已 refunded，或已 settled 的实际用量/成本不同 | ErrFinalizationConflict，原请求 failed | 不重新预约，不覆盖原账。 |
+| 数据库/密钥服务等暂时不可用 | 返回错误，保留原阶段由调度重试 | 不误标业务成功/失败、不开始新模型运行。 |
+| 有取消意图或资格丢失 | 取消协议裁决或等待新 owner | 已有结果也不能绕过取消/Fence。 |
+
+governance.Finalization.Validate 核对预约/政策/tenant/request、model/tokens 阶段、ExpectedVersion、分模型用量汇总、输出摘要、决定 ID/动作/原因及预算上限；汇总拒绝整数溢出和 cached input 大于 input。CommitFinalization 再查真实预约，区分已结算可重放与已退款/异账冲突，不重新审核或报价。
+
+恢复矛盾原因使用 completion_conflict、legacy_result_conflict、sealed_result_missing、closed_reservation_without_completion。参与 TaskPlans 的请求先保存同原因 failed 计划，再提交 failed terminal；若两步之间再次崩溃，下一 owner 重入同一路径，不尝试用普通任务失败文本覆盖已有可疑 result_payload。该异常分支只有 audit，无用户回复，不代表成功完成或已通知用户；需运维核查原证据。普通、可确认的任务失败仍提交既有安全失败回复。
+
+本次无新增数据库迁移，依然要求 000007。自定义会话 Store 还需实现 TerminalHistoryReader，生产 PG 和本地测试实现均已接入。新 Worker 的终态历史投影详见[会话设计](../conversation-continuity/design.md#重试历史的读取视图)。
+
 `execution_completion` 是内部不可变完成日志，不能由 Delivery 当成最终回复读取。原流程在结算之后、PutResult 之前崩溃会留下“预约已关闭、无冻结答案”；新 owner 再 Begin 会被拒绝。现在把已审核的输出和结算意图先持久化，再执行可幂等重放的治理写入。
 
 | 字段 | 类型与约束 | 设计作用 |
@@ -16,7 +39,7 @@
 | `fence` | bigint，正数 | 创建者执行资格；恢复可使用更高 Fence。 |
 | `created_at` | timestamptz，默认数据库 now() | 候选创建时间，不是回复送达时间。 |
 
-密文 AAD 使用 execution-completion-v1、tenant、request、envelope_digest、content_digest 和 key_version；替换作用域或正文摘要不能通过解密。解密后再次校验摘要、原 envelope、输入摘要和内容类型。候选 JSON 包括 SchemaVersion、Envelope、InputDigest、Permit、Prepared、Usage、Output；Prepared 包含 Settlement、Decision、OutputDigest。Usage 为按实际模型分组的数组，避免将结构体键 map 直接 JSON 序列化。
+密文 AAD 使用 execution-completion-v1、tenant、request、envelope_digest、content_digest 和 key_version；替换作用域或正文摘要不能通过解密。解密后再次校验摘要、原 envelope、输入摘要和内容类型。候选 JSON 包括 SchemaVersion、Envelope、InputDigest、Permit、Prepared、Usage、Output、PlanDigest；Prepared 包含 Settlement、Decision、OutputDigest。Usage 为按实际模型分组的数组，避免将结构体键 map 直接 JSON 序列化。
 
 | 操作与窗口 | durable truth | 接管动作 |
 |---|---|---|
@@ -24,7 +47,7 @@
 | 候选保存成功、尚未结算 | 私有候选及原审核决定 | 跳过模型与 BeginAttempt，提交候选中的原结算。 |
 | Settle 成功、决策尚未记录 | 候选、已结算预约 | 相同 SettleRequest 幂等重放，再 RecordDecision。 |
 | 治理已提交、PutResult 前 | 候选、原治理决定 | 不重新 Begin、不重新审核或按当前报价重算。 |
-| PutResult 后、terminal 前 | 已批准公开结果 | 原 frozen 分支续提交、Seal、terminal/Outbox。 |
+| PutResult 后、terminal 前 | 已批准公开结果及适用的候选 | 交叉核对候选/结果后续提交、Seal、terminal/Outbox；无候选走旧版兼容。 |
 
 PutCompletion 使用 execution_record 行锁与 BeginExecutionAttempt 串行，并读取已登记最大 Fence，防止被新尝试超越的旧执行者插入候选。插入还检查会话 next_input_seq 与 last_fence；主键冲突不覆盖正文，必须 envelope、内容摘要、密钥版本和解密正文一致才算幂等。Worker 在保存候选、结算和提交前继续检查租约与取消意图。Redis 与 PostgreSQL 不是一个事务，外部取消和已完成效果也不由这张表撤销。
 

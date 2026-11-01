@@ -1,5 +1,11 @@
 # 在途任务接管与幂等投递 — 测试与验收
 
+## 恢复状态交叉校验回归
+
+`worker/recovery_state_test.go` 覆盖候选与公开结果冲突、候选读取损坏、完成计划修订、sealed 无结果、恢复 failed 计划后 terminal 写入再次失败、旧候选兼容、同一时刻不同时区表示以及临时数据库错误。矛盾状态必须 failed/audit、无可疑 reply、原证据不覆盖且下一 input_seq 可推进；临时错误不能被误判为业务终态，也不能进入模型路径。
+
+`worker/completion_test.go` 增加候选保存后预约 refunded 和实际结算用量不同的回归，必须安全终止而不再次预约/生成。`governance/finalization_test.go` 覆盖 request/预约/阶段/用量/成本/决定/输出篡改、用量加法溢出和非法 cached tokens。新增 SchemaVersion=2 的 PlanDigest 在恢复时与当前原输入/合同/步骤证据匹配；旧 SchemaVersion=1 不提供这项新增绑定。
+
 ## 完成候选、工具适配与历史视图回归
 
 | 反例或注入位置 | 代码回归判据 | 证据入口 |

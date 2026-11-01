@@ -189,7 +189,11 @@ func (s Service) PrepareFinalization(ctx context.Context, permit RunPermit, usag
 	if err != nil {
 		return Finalization{}, err
 	}
-	return Finalization{Settlement: settlement, Decision: decision, OutputDigest: contentDigest(output)}, nil
+	f := Finalization{Settlement: settlement, Decision: decision, OutputDigest: contentDigest(output)}
+	if err = f.Validate(permit, usages, output); err != nil {
+		return Finalization{}, err
+	}
+	return f, nil
 }
 
 func (s Service) prepareFinalization(ctx context.Context, permit RunPermit, usages []ModelUsage, output []byte) (Decision, SettleRequest, error) {
@@ -197,14 +201,13 @@ func (s Service) prepareFinalization(ctx context.Context, permit RunPermit, usag
 	if permit.Decision.Action != ActionAllow || permit.Reservation.ReservationID == "" {
 		return Decision{}, empty, runtime.ErrInvariantViolation
 	}
-	var aggregate Usage
-	for _, value := range usages {
-		if value.Model.ID == "" || value.Model.Version < 1 || value.Usage.InputTokens < 0 || value.Usage.OutputTokens < 0 || value.Usage.CachedInputTokens < 0 {
-			return Decision{}, empty, runtime.ErrInvariantViolation
-		}
-		aggregate.InputTokens += value.Usage.InputTokens
-		aggregate.OutputTokens += value.Usage.OutputTokens
-		aggregate.CachedInputTokens += value.Usage.CachedInputTokens
+	if len(usages) == 0 {
+		s.recordUsageMissing(ctx)
+		return Decision{}, empty, runtime.ErrCapabilityUnsupported
+	}
+	aggregate, err := aggregateModelUsage(usages)
+	if err != nil {
+		return Decision{}, empty, err
 	}
 	if len(usages) == 0 || ((permit.Policy.Policy.Budget.MaxInputTokens > 0 || permit.Policy.Policy.Budget.MaxOutputTokens > 0 || permit.Policy.Policy.Budget.MaxCostMicrosPerRun > 0) && aggregate.InputTokens+aggregate.OutputTokens == 0) {
 		s.recordUsageMissing(ctx)
@@ -241,6 +244,13 @@ func (s Service) CommitFinalization(ctx context.Context, in Finalization) (Decis
 	d, r := in.Decision, in.Settlement
 	if s.Ledger == nil || s.Decisions == nil || len(in.OutputDigest) != 64 || d.TenantID == "" || d.TenantID != r.TenantID || d.RequestID != r.RequestID || d.ReservationID != r.ReservationID || d.PolicyVersion < 1 || d.Stage != "output" || (d.Action != ActionAllow && d.Action != ActionDeny) || d.DecisionID != StableDecisionID(d.TenantID, d.RequestID, "output", d.PolicyVersion) {
 		return Decision{}, runtime.ErrInvariantViolation
+	}
+	current, err := s.Ledger.GetReservation(ctx, r.TenantID, r.ReservationID)
+	if err != nil {
+		return Decision{}, err
+	}
+	if current.RequestID != r.RequestID || current.PolicyVersion != d.PolicyVersion || current.State == ReservationRefunded || (current.State == ReservationReserved && current.Version != r.ExpectedVersion) || (current.State == ReservationSettled && (current.ActualCostMicros != r.ActualCostMicros || current.InputTokens != r.Usage.InputTokens || current.OutputTokens != r.Usage.OutputTokens)) {
+		return Decision{}, ErrFinalizationConflict
 	}
 	if _, err := s.Ledger.Settle(ctx, r); err != nil {
 		return Decision{}, err

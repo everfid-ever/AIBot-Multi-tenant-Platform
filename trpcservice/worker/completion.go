@@ -1,8 +1,10 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
@@ -21,6 +23,7 @@ type completionCandidate struct {
 	Prepared      *governance.Finalization
 	Usage         []governance.ModelUsage
 	Output        OutboundContent
+	PlanDigest    string
 }
 
 func (w RunnerExecutor) completionStore() messaging.CompletionStore {
@@ -39,7 +42,14 @@ func (w RunnerExecutor) saveCompletion(ctx context.Context, e runtime.ExecutionE
 	if s == nil {
 		return messaging.CompletionRecord{}, runtime.ErrCapabilityUnsupported
 	}
-	c := completionCandidate{SchemaVersion: 1, Envelope: e, InputDigest: taskflow.Digest(payload.Content), Usage: runnerModelUsages(permit.Model, result), Output: out}
+	c := completionCandidate{SchemaVersion: 2, Envelope: e, InputDigest: taskflow.Digest(payload.Content), Usage: runnerModelUsages(permit.Model, result), Output: out}
+	if task := taskflow.FromContext(ctx); task != nil {
+		p, err := task.ValidateCompletion(ctx)
+		if err != nil {
+			return messaging.CompletionRecord{}, err
+		}
+		c.PlanDigest = completionPlanDigest(p)
+	}
 	if w.Governance != nil {
 		c.Permit = &permit
 		if guard, ok := w.Governance.(governance.PreparedRunGuard); ok {
@@ -69,21 +79,46 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 	if err := r.Validate(); err != nil {
 		return err
 	}
-	if r.TenantID != e.TenantID || r.RequestID != e.RequestID || r.KeyVersion != payload.KeyVersion || r.EnvelopeDigest != envelopeDigest(e) || r.Fence > fence {
+	if r.TenantID != e.TenantID || r.RequestID != e.RequestID || r.KeyVersion != payload.KeyVersion || r.Fence > fence {
 		return runtime.ErrVersionMismatch
 	}
 	var c completionCandidate
 	if err := json.Unmarshal(r.Content, &c); err != nil {
 		return runtime.ErrInvariantViolation
 	}
-	contentType, typeErr := messaging.NormalizeContentType(c.Output.ContentType)
-	if c.SchemaVersion != 1 || c.InputDigest != taskflow.Digest(payload.Content) || verifyAuthoritativeEnvelope(c.Envelope, e) != nil || len(c.Output.Content) == 0 || typeErr != nil || contentType != c.Output.ContentType {
+	validated, typeErr := validateOutbound(c.Output)
+	if (c.SchemaVersion != 1 && c.SchemaVersion != 2) || r.EnvelopeDigest != envelopeDigest(c.Envelope) || c.InputDigest != taskflow.Digest(payload.Content) || verifyAuthoritativeEnvelope(c.Envelope, e) != nil || typeErr != nil || validated.ContentType != c.Output.ContentType {
 		return runtime.ErrVersionMismatch
 	}
 	if task := taskflow.FromContext(ctx); task != nil {
-		if _, err := task.ValidateCompletion(ctx); err != nil {
+		p, err := task.ValidateCompletion(ctx)
+		if err != nil {
 			return err
 		}
+		if c.SchemaVersion == 2 && c.PlanDigest != completionPlanDigest(p) {
+			return runtime.ErrVersionMismatch
+		}
+	} else if c.SchemaVersion == 2 && c.PlanDigest != "" {
+		return runtime.ErrVersionMismatch
+	}
+	ref, err := encodeResultRef(ctx, w.EncodeResult, e, string(c.Output.Content))
+	if err != nil {
+		return err
+	}
+	results, ok := w.Payloads.(messaging.ResultStore)
+	if !ok {
+		return runtime.ErrCapabilityUnsupported
+	}
+	frozen, frozenErr := results.GetResult(ctx, e.TenantID, e.RequestID)
+	if frozenErr == nil {
+		if err = validateFrozenResult(frozen, e); err != nil {
+			return err
+		}
+		if frozen.KeyVersion != payload.KeyVersion || frozen.ResultRef != ref || frozen.ContentType != c.Output.ContentType || !bytes.Equal(frozen.Content, c.Output.Content) {
+			return runtime.ErrIdempotencyCollision
+		}
+	} else if !errors.Is(frozenErr, runtime.ErrNotFound) {
+		return frozenErr
 	}
 	latest, err := w.Tasks.GetExecution(ctx, gateway.ExecutionKey{TenantID: e.TenantID, RequestID: e.RequestID})
 	if err != nil {
@@ -109,6 +144,12 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 			guard, ok := w.Governance.(governance.PreparedRunGuard)
 			if !ok || c.Prepared.OutputDigest != taskflow.Digest(c.Output.Content) || c.Prepared.Decision.TenantID != e.TenantID || c.Prepared.Decision.RequestID != e.RequestID || c.Prepared.Decision.PolicyVersion != e.PolicyVersion || c.Prepared.Decision.ReservationID != c.Permit.Reservation.ReservationID || c.Prepared.Settlement.ExpectedVersion != c.Permit.Reservation.Version {
 				return runtime.ErrVersionMismatch
+			}
+			if err = c.Prepared.Validate(*c.Permit, c.Usage, c.Output.Content); err != nil {
+				return err
+			}
+			if frozenErr == nil && c.Prepared.Decision.Action != governance.ActionAllow {
+				return runtime.ErrInvariantViolation
 			}
 			decision, err = guard.CommitFinalization(ctx, *c.Prepared)
 		} else {
@@ -140,14 +181,6 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 			return err
 		}
 	}
-	ref, err := encodeResultRef(ctx, w.EncodeResult, e, string(c.Output.Content))
-	if err != nil {
-		return err
-	}
-	results, ok := w.Payloads.(messaging.ResultStore)
-	if !ok {
-		return runtime.ErrCapabilityUnsupported
-	}
 	if err = results.PutResult(ctx, messaging.ResultRecord{TenantID: e.TenantID, RequestID: e.RequestID, ResultRef: ref, ContentDigest: taskflow.Digest(c.Output.Content), Content: c.Output.Content, ContentType: c.Output.ContentType, KeyVersion: payload.KeyVersion}); err != nil {
 		return err
 	}
@@ -157,4 +190,15 @@ func (w RunnerExecutor) resumeCompletion(ctx context.Context, turn *sessionstore
 		}
 	}
 	return w.commitFrozenSuccess(ctx, turn, e, head, fence, before, ref)
+}
+
+// Fence/version/phase change during adoption/sealing; declared obligations and
+// their evidence must remain identical to those reviewed with this candidate.
+func completionPlanDigest(p taskflow.Plan) string {
+	b, _ := json.Marshal(struct {
+		InputDigest string
+		Contract    taskflow.Contract
+		Steps       []taskflow.Step
+	}{p.InputDigest, p.Contract, p.Steps})
+	return taskflow.Digest(b)
 }

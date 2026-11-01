@@ -43,6 +43,10 @@ func renderOutbound(ctx context.Context, renderer OutboundRenderer, envelope run
 			return OutboundContent{}, err
 		}
 	}
+	return validateOutbound(value)
+}
+
+func validateOutbound(value OutboundContent) (OutboundContent, error) {
 	contentType, err := messaging.NormalizeContentType(value.ContentType)
 	if err != nil || len(value.Content) == 0 {
 		return OutboundContent{}, runtime.ErrInvariantViolation

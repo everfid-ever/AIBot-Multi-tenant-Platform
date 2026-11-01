@@ -1,5 +1,130 @@
 # 故障恢复后继续对话 — 实现代码附录
 
+## 权威终态的模型上下文投影
+
+来源：`trpcservice/worker/terminal_history.go`，完整文件。核对原输入/身份/附件与精确结果引用，拒绝把草稿或未审核输入重新引入模型。对应 worker/terminal_history_test.go。
+
+```go
+package worker
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+	sessionstore "github.com/liuzengh/trpc-agent-service/trpcservice/storage/session"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+func (w RunnerExecutor) committedHistory(ctx context.Context, e runtime.ExecutionEnvelope) ([]sessionstore.CommittedHistoryTurn, error) {
+	reader, ok := w.Sessions.(sessionstore.TerminalHistoryReader)
+	if !ok {
+		return nil, runtime.ErrCapabilityUnsupported
+	}
+	key := sessionstore.SessionKey{TenantID: e.TenantID, AgentAppID: e.AgentAppID, SessionID: e.SessionID}
+	rows, err := reader.ListTerminalHistory(ctx, key, e.InputSeq, sessionstore.MaxHistoryTurns)
+	if err != nil {
+		return nil, err
+	}
+	if e.InputSeq > 1 && (len(rows) == 0 || rows[len(rows)-1].InputSeq != e.InputSeq-1) {
+		return nil, runtime.ErrInvariantViolation
+	}
+	results, ok := w.Payloads.(messaging.ResultStore)
+	if !ok {
+		return nil, runtime.ErrCapabilityUnsupported
+	}
+	var history []sessionstore.CommittedHistoryTurn
+	var previous uint64
+	for _, row := range rows {
+		if row.RequestID == "" || row.CommitID == "" || row.Fence == 0 || !row.Outcome.Terminal() || row.InputSeq <= previous || (previous > 0 && row.InputSeq != previous+1) || row.InputSeq >= e.InputSeq {
+			return nil, runtime.ErrInvariantViolation
+		}
+		previous = row.InputSeq
+		status, err := w.Tasks.GetExecution(ctx, gateway.ExecutionKey{TenantID: e.TenantID, RequestID: row.RequestID})
+		if err != nil {
+			return nil, err
+		}
+		original := status.Envelope
+		if original.TenantID != e.TenantID || original.AgentAppID != e.AgentAppID || original.SessionID != e.SessionID || original.UserID != e.UserID || original.RequestID != row.RequestID || original.InputSeq != row.InputSeq {
+			return nil, runtime.ErrTenantScope
+		}
+		if row.CommittedAt.IsZero() {
+			row.CommittedAt = original.CreatedAt
+		}
+		h := sessionstore.CommittedHistoryTurn{TerminalHistory: row}
+		var inputKeyVersion int64
+		// Rejected/cancelled input may never have passed input DLP. Do not
+		// introduce it into a later model context through the history path.
+		if row.Outcome == runtime.OutcomeSucceeded {
+			payload, err := w.executionPayload(ctx, original)
+			if err != nil {
+				return nil, err
+			}
+			if payload.TenantID != e.TenantID || payload.RequestID != row.RequestID || payload.PayloadRef != original.PayloadRef {
+				return nil, runtime.ErrVersionMismatch
+			}
+			input, err := w.Inputs.DecodeInput(ctx, original, payload.Content)
+			if err != nil {
+				return nil, err
+			}
+			if input.Role != model.RoleUser || !validPreparedMessage(input) {
+				return nil, runtime.ErrInvalidEnvelope
+			}
+			if err = w.hydrateArtifacts(ctx, original, &input); err != nil {
+				return nil, err
+			}
+			inputKeyVersion = payload.KeyVersion
+			h.Input = &input
+		}
+		if row.ResultRef != "" {
+			if row.Outcome != runtime.OutcomeSucceeded && row.Outcome != runtime.OutcomeFailed {
+				return nil, runtime.ErrInvariantViolation
+			}
+			r, err := results.GetResult(ctx, e.TenantID, row.RequestID)
+			if err != nil {
+				return nil, err
+			}
+			if err = validateFrozenResult(r, original); err != nil {
+				return nil, err
+			}
+			if r.ResultRef != row.ResultRef {
+				return nil, runtime.ErrVersionMismatch
+			}
+			if inputKeyVersion > 0 && r.KeyVersion != inputKeyVersion {
+				return nil, runtime.ErrVersionMismatch
+			}
+			// A failed terminal can carry the deliberately safe failure result.
+			// Never substitute an uncommitted model draft for this exact payload.
+			if r.ContentType == messaging.ContentTypeText || r.ContentType == messaging.ContentTypeCard {
+				h.Answer = model.NewAssistantMessage(string(r.Content))
+			} else {
+				h.Answer = model.NewAssistantMessage(fmt.Sprintf("[服务端已提交 %s 结果，引用 %s；渠道送达状态需另查投递记录]", r.ContentType, row.ResultRef))
+			}
+		} else {
+			if row.Outcome == runtime.OutcomeSucceeded {
+				return nil, runtime.ErrInvariantViolation
+			}
+			h.Answer = model.NewAssistantMessage(fmt.Sprintf("[服务端执行状态：%s；未提交可用最终答案。此状态不表示外部副作用已回滚，也不表示已向用户发送通知。]", row.Outcome))
+		}
+		history = append(history, h)
+	}
+	return history, nil
+}
+
+func validateFrozenResult(r messaging.ResultRecord, e runtime.ExecutionEnvelope) error {
+	contentType, err := messaging.NormalizeContentType(r.ContentType)
+	if r.TenantID != e.TenantID || r.RequestID != e.RequestID || r.ResultRef == "" || r.KeyVersion < 1 || r.ContentDigest != taskflow.Digest(r.Content) || err != nil {
+		return runtime.ErrVersionMismatch
+	}
+	_, err = validateOutbound(OutboundContent{Content: r.Content, ContentType: contentType})
+	return err
+}
+```
+
+
 ## 请求与 Fence 感知的历史读取实现
 
 来源：`trpcservice/storage/session/history.go`，完整文件。仅改变读取副本，保留 SDK 事件 ID 及原始存储；当前请求旧尝试省略，其他请求按最高观测 Fence 整理并过滤孤立工具记录。详细兼容边界见 [设计](design.md#重试历史的读取视图)。
@@ -196,6 +321,46 @@ func (t *BufferedTurn) historyView(raw *agentsession.Session) *agentsession.Sess
 	// alternate history sources in the view; persistent SDK state is untouched.
 	v.Tracks = nil
 	v.Summaries = nil
+	v = t.projectCommittedHistory(v, s)
+	return v
+}
+
+func (t *BufferedTurn) projectCommittedHistory(v *agentsession.Session, scope historyScope) *agentsession.Session {
+	t.mu.Lock()
+	enabled := t.authoritativeHistory
+	turns := append([]CommittedHistoryTurn(nil), t.committedHistory...)
+	t.mu.Unlock()
+	if !enabled {
+		return v
+	}
+	// Past SDK events (including unknown legacy roots) are audit facts, not
+	// evidence that a draft was committed. Only the current attempt/approved
+	// continuation remains live; every past turn comes from terminal truth.
+	var current []agentevent.Event
+	for i := range v.Events {
+		if eventScope(&v.Events[i]).RequestID == scope.RequestID {
+			current = append(current, v.Events[i])
+		}
+	}
+	v.Events = nil
+	for _, turn := range turns {
+		appendMessage := func(kind string, m model.Message) {
+			stamp, _ := json.Marshal(historyScope{RequestID: turn.RequestID, Fence: turn.Fence})
+			terminal, _ := json.Marshal(turn.TerminalHistory)
+			author := ""
+			if kind == "user" {
+				author = "user"
+			}
+			response := (&model.Response{Done: true, Choices: []model.Choice{{Message: m}}}).Clone()
+			v.Events = append(v.Events, agentevent.Event{ID: "terminal:" + turn.CommitID + ":" + kind, RequestID: turn.RequestID, InvocationID: "terminal:" + turn.CommitID, Author: author, Timestamp: turn.CommittedAt,
+				Response: response, Extensions: map[string]json.RawMessage{historyExtension: stamp, "trpc.terminal.v1": terminal}})
+		}
+		if turn.Input != nil {
+			appendMessage("user", *turn.Input)
+		}
+		appendMessage("assistant", turn.Answer)
+	}
+	v.Events = append(v.Events, current...)
 	return v
 }
 ```

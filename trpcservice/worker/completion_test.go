@@ -40,7 +40,7 @@ func (crashAfterSettlement) Wait(_ context.Context, p inflight.Point) error {
 }
 
 func TestCompletionCandidateRecoversAcrossSettlementWithoutNewRun(t *testing.T) {
-	for _, window := range []string{"before_settlement", "after_settlement", "stale_owner", "output_denied"} {
+	for _, window := range []string{"before_settlement", "after_settlement", "stale_owner", "output_denied", "refunded_after_candidate", "conflicting_settlement"} {
 		t.Run(window, func(t *testing.T) {
 			ctx := context.Background()
 			e := runtime.ExecutionEnvelope{SchemaVersion: 1, TenantID: "tenant-a", TenantVersion: 1, AgentAppID: "app", AgentAppVersion: 1, AgentAppRevision: 1, AgentContentDigest: "digest", ConfigVersion: 1, PolicyVersion: 1, RequestID: "request", SessionID: "session", UserID: "user", Channel: "fake", InputSeq: 1, PayloadRef: "payload://request", CreatedAt: time.Now().UTC()}
@@ -93,6 +93,16 @@ func TestCompletionCandidateRecoversAcrossSettlementWithoutNewRun(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
+			if window == "refunded_after_candidate" {
+				if err = service.Refund(ctx, permit, "test refund"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if window == "conflicting_settlement" {
+				if _, err = ledger.Settle(ctx, governance.SettleRequest{TenantID: e.TenantID, RequestID: e.RequestID, ReservationID: permit.Reservation.ReservationID, ExpectedVersion: permit.Reservation.Version, Stage: "model", UsageKind: "tokens", Usage: governance.Usage{InputTokens: 20, OutputTokens: 5}}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if window == "after_settlement" {
 				head, err := sessions.OpenForRun(ctx, sessionstore.OpenForRunRequest{SessionKey: sessionstore.SessionKey{TenantID: e.TenantID, AgentAppID: e.AgentAppID, SessionID: e.SessionID}, RequestID: e.RequestID, InputSeq: 1, Fence: 1})
 				if err != nil {
@@ -120,7 +130,7 @@ func TestCompletionCandidateRecoversAcrossSettlementWithoutNewRun(t *testing.T) 
 				t.Fatalf("output reviewed %d times", guard.calls)
 			}
 			result, err := payloads.GetResult(ctx, e.TenantID, e.RequestID)
-			if window == "output_denied" {
+			if window == "output_denied" || window == "refunded_after_candidate" || window == "conflicting_settlement" {
 				if !errors.Is(err, runtime.ErrNotFound) {
 					t.Fatal("denied candidate leaked into public result")
 				}

@@ -12,16 +12,18 @@ import (
 // BufferedTurn is the service-owned transaction bridge used until upstream
 // exposes a native atomic commit hook.
 type BufferedTurn struct {
-	mu        sync.Mutex
-	store     AtomicSessionStore
-	backing   agentsession.Service
-	key       SessionKey
-	appName   string
-	userID    string
-	closed    bool
-	committed bool
-	history   historyScope
-	service   *bufferedSessionService
+	mu                   sync.Mutex
+	store                AtomicSessionStore
+	backing              agentsession.Service
+	key                  SessionKey
+	appName              string
+	userID               string
+	closed               bool
+	committed            bool
+	history              historyScope
+	committedHistory     []CommittedHistoryTurn
+	authoritativeHistory bool
+	service              *bufferedSessionService
 }
 
 func NewBufferedTurn(store AtomicSessionStore, backing agentsession.Service, key SessionKey, userID string) (*BufferedTurn, error) {

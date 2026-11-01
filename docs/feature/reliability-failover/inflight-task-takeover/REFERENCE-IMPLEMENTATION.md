@@ -19,7 +19,7 @@ CREATE TABLE public.execution_completion (
 );
 ```
 
-PreparedRunGuard 的函数顺序为 PrepareFinalization（只读审核/计算）→ 持久化候选 → CommitFinalization（幂等 Settle + RecordDecision）→ 公开 PutResult → terminal/Outbox。恢复先查公开结果，再查私有候选；候选必须核对 schema、输入摘要、完整 envelope、密钥版本、创建 Fence 不高于当前 Fence、原预约、输出摘要与审核决定的 tenant/request/policy。不得重新申请预约或重新价格计算。拒绝输出不能创建可投递的成功结果。自定义非 PreparedRunGuard 的实现须另行保证 Finish 的幂等性。
+PreparedRunGuard 的函数顺序为 PrepareFinalization（只读审核/计算）→ 持久化候选 → CommitFinalization（幂等 Settle + RecordDecision）→ 公开 PutResult → terminal/Outbox。恢复先查私有候选并交叉核对已有公开结果，无候选才读旧公开结果；SchemaVersion=2 还必须验证 PlanDigest（原输入、合同和完成步骤证据），SchemaVersion=1 仅提供旧合同兼容。候选必须核对 schema、输入摘要、完整 envelope、密钥版本、创建 Fence 不高于当前 Fence、原预约、输出摘要与审核决定的 tenant/request/policy。不得重新申请预约或重新价格计算。拒绝输出不能创建可投递的成功结果。自定义非 PreparedRunGuard 的实现须另行保证 Finish 的幂等性。
 
 MCP Config 新增 ReadOnly、IdempotencyParameter、CompletionCheck（Path/EqualsJSON/NonEmpty）三个代码审核配置：只读与幂等键互斥；幂等键要求合法远端 string 参数及非空有效 CompletionCheck。契约进入绑定摘要，声明验证在每次连接执行；提供商键由可信身份派生，模型输入不得携带保留参数。CompletionCheck 针对实际序列化结果，当前上游 MCP 常以 content 数组序列化，不能假定存在 status 对象字段或自动解析 text 内 JSON。未实现提供商查询协议时不得配置成 queryable。code_exec 使用 manual 恢复，只有真实成功执行可产生 status=completed；CompletionContract=1 进入其绑定摘要。
 

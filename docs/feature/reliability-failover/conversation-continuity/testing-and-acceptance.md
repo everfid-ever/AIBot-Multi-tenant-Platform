@@ -1,5 +1,11 @@
 # 故障恢复后继续对话 — 测试与验收
 
+## 终态与后续上下文的一致性回归
+
+`worker/terminal_history_test.go` 经真实 SDK 验证：模型原始草稿经 renderer 形成不同最终答案，在候选已保存/公开结果未保存时退出，接管提交不增加模型调用；再向 SDK 写入迟到高 Fence 错误答案，下一轮模型仍收到原输入和准确的最终 assistant 消息，不含草稿。另覆盖 denied/cancelled/failed/confirmation_denied/timeout 的安全历史、原输入不重新暴露和跨用户读取拒绝。`storage/session/history_test.go` 校验投影不修改原事件，`session/{postgres,inmemory}/terminal_history_test.go` 校验作用域、顺序与最近窗口。
+
+原基础最高 Fence 过滤测试继续保留，用于独立 BufferedTurn 兼容；Worker 的过去轮次以终态投影为准，不能把最高 Fence 当作获胜答案。字段语义和最近 100 轮边界见 [设计](design.md#重试历史的读取视图)。
+
 重试历史回归见 `storage/session/history_test.go`：同 request 的旧 Fence 省略、不同 request 的相同文本保留、其他请求最高 Fence 胜过迟到旧事件、Event.ID 去重、孤立 call/result 过滤、当前正在执行 call 保留、批准确认调用精确保留。测试还验证读取副本不修改原事件或 State。真实模型验收需另采集本轮模型输入与持久原始历史，不能仅据数据库事件数量判断上下文质量。
 
 ## 分开记录实现检查与业务结论

@@ -53,7 +53,7 @@
 
 Mapper 从可信 Binding 取 tenant，单聊以 channel/account/user 派生 session，群聊以 chat 派生。identity/session 使用不同 purpose 的租户密钥。SDK TenantKey 把 tenant/app 编码到 app_name，checked facade 对 app/user/session 任一不匹配拒绝。ReplyRoute 随持久 payload 固定，接管者不能用当前模型输出选择 Bot。
 
-官方会话 service 关闭 async persist，事件同步写入。BufferedTurn.Commit 明确清空平台 Events/StateDelta/SummaryCandidate，避免重复真相源；Rollback 只丢弃进程内协调元数据，不撤销 SDK 写入。Worker.ConfigureHistory 为事件标记原 request/Fence，GetSession 返回整理后的读取副本，过滤重试残留及可辨识孤立工具消息；原始事件仍可能包含第二次同内容输入，因此终态幂等、上下文读取整理与原始历史去重不能混为一谈。完整策略及兼容边界见 [设计](design.md#重试历史的读取视图)。
+官方会话 service 关闭 async persist，事件同步写入。BufferedTurn.Commit 明确清空平台 Events/StateDelta/SummaryCandidate，避免重复真相源；Rollback 只丢弃进程内协调元数据，不撤销 SDK 写入。Worker.ConfigureHistory 标记原 request/Fence，committedHistory 从 session_commit 读取最多 100 个过去终态并核对原输入/精确结果，ConfigureCommittedHistory 使 GetSession 用该投影替换过去草稿；当前轮仍过滤重试残留并保留批准调用；原始事件仍可能包含第二次同内容输入，因此终态幂等、上下文读取整理与原始历史去重不能混为一谈。完整策略及兼容边界见 [设计](design.md#重试历史的读取视图)。
 
 ## 执行恢复分支
 

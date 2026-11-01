@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"testing"
 
 	agentevent "trpc.group/trpc-go/trpc-agent-go/event"
@@ -81,5 +82,31 @@ func TestHistoryStampOverridesUntrustedMetadataAndKeepsIDs(t *testing.T) {
 	v := turn.stampEvent(&e)
 	if v.ID != "stable" || eventScope(v).RequestID != "trusted" || eventScope(v).Fence != 7 || eventScope(&e).Fence != 999 {
 		t.Fatal("invalid trusted history stamp")
+	}
+}
+
+func TestCommittedHistoryReplacesDraftsEvenWhenLosingFenceIsHigher(t *testing.T) {
+	raw := &agentsession.Session{Events: []agentevent.Event{
+		historyEvent("winner", "previous", 2, model.NewAssistantMessage("raw unrendered answer")),
+		historyEvent("late", "previous", 99, model.NewAssistantMessage("incorrect late draft")),
+		historyEvent("failed", "failure", 7, model.NewAssistantMessage("false success")),
+		historyEvent("active", "current", 100, historyCall("live")),
+	}}
+	turn := &BufferedTurn{}
+	turn.ConfigureHistory("current", 100, "")
+	input := model.NewUserMessage("original input")
+	turn.ConfigureCommittedHistory([]CommittedHistoryTurn{
+		{TerminalHistory: TerminalHistory{RequestID: "previous", CommitID: "winner", InputSeq: 1, Fence: 2, Outcome: runtime.OutcomeSucceeded}, Input: &input, Answer: model.NewAssistantMessage("exact committed answer")},
+		{TerminalHistory: TerminalHistory{RequestID: "failure", CommitID: "failure", InputSeq: 2, Fence: 7, Outcome: runtime.OutcomeFailed}, Answer: model.NewAssistantMessage("safe failure")},
+	})
+	v := turn.historyView(raw)
+	if len(v.Events) != 4 || v.Events[0].Choices[0].Message.Content != "original input" || v.Events[1].Choices[0].Message.Content != "exact committed answer" || v.Events[2].Choices[0].Message.Content != "safe failure" || v.Events[3].ID != "active" {
+		t.Fatalf("projection=%+v", v.Events)
+	}
+	if v.Events[1].Author != "" {
+		t.Fatal("synthetic answer would be converted to a foreign-agent user message")
+	}
+	if len(raw.Events) != 4 || raw.Events[1].Choices[0].Message.Content != "incorrect late draft" {
+		t.Fatal("audit trail mutated")
 	}
 }

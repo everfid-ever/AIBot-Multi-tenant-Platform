@@ -1,5 +1,13 @@
 # 故障恢复后继续对话 — 参考实现
 
+## 终态历史投影的当前契约
+
+新增 TerminalHistoryReader.ListTerminalHistory(ctx, SessionKey, beforeInputSeq, limit)，不改原 AtomicSessionStore 接口，也不新增数据库表。Worker 要求该接口可用，生产 PG 与本地 inmemory 已实现。limit 限 1–100；按 tenant/app/session 过滤、只读 input_seq < beforeInputSeq 的六类 terminal，先倒序取最新窗口再正序输出。返回 RequestID、CommitID、InputSeq、Fence、Outcome、ResultRef、CommittedAt，分别来自既有 session_commit 同名字段。
+
+Worker.committedHistory 用每条 RequestID 读取原执行 envelope，核对 tenant/app/session/user/input_seq。成功轮读取原始或 prepared payload，用既有 InputDecoder 解码并验证附件 tenant/request/ref/digest，再按 terminal 的精确 ResultRef 校验结果摘要和密钥版本；失败轮仅使用提交的安全失败结果或明确终态标记，不重新加载可能未审核的输入。窗口内序号必须连续，最后一条必须是当前 input_seq−1；缺失或读取错误不降级为空历史。
+
+ConfigureCommittedHistory 将这一有序快照装入本轮门面，GetSession 在副本中替换过去 SDK 事件；只保留当前原 request 的合格实时事件/批准确认调用。合成用户/助手消息使用稳定 terminal:commit 坐标，assistant Author 为空，保留正确 assistant 角色；不回写原始 SDK 表，不创建第二份聊天存储。SDK State 不被事务回滚。合法的非文本结果以格式/引用说明进入模型上下文，不推断图片内容；文本及结构化卡片保留精确提交内容。终态可用于业务上下文，不证明渠道送达。
+
 ## 复刻前提、迁移与实现范围
 
 本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次 000002、000003、000004；不要把本文摘录再次应用到已迁移库。

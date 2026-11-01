@@ -2,7 +2,7 @@
 
 本文是阅读摘要，详细机制、字段、代码及验收分别在同目录L1–L4文档中展开，所有正文使用同一当前实现口径。
 
-`000007_execution_completion` 将输出审核与治理写入分开：完整 envelope、输入摘要、原预约、分模型用量、确定的结算参数、输出审核决定与最终渲染内容先加密保存。候选不可改写且不是可投递结果；接管者跳过新的模型运行，重放原结算决定，再保存 result_payload 和 terminal/Outbox。即使预约已 settled，也不重新 Begin 而误判为 reservation_closed。读取顺序是已冻结结果 → 完成候选 → 新模型运行。SQL 候选写入还与 execution_attempt 的执行记录锁串行，拒绝已被新 Fence 超越的写入。
+`000007_execution_completion` 将输出审核与治理写入分开：完整 envelope、输入摘要、原预约、分模型用量、确定的结算参数、输出审核决定与最终渲染内容先加密保存。候选不可改写且不是可投递结果；接管者跳过新的模型运行，重放原结算决定，再保存 result_payload 和 terminal/Outbox。即使预约已 settled，也不重新 Begin 而误判为 reservation_closed。读取顺序是先核对完成候选及其关联公开结果，再兼容无候选的旧冻结结果，最后才考虑新模型运行。新候选 SchemaVersion=2 额外绑定 PlanDigest，矛盾状态提交明确 failed/audit 并保留证据，不盲目重算或发送。SQL 候选写入还与 execution_attempt 的执行记录锁串行，拒绝已被新 Fence 超越的写入。
 
 MCP 恢复默认 manual；经代码审核的 ReadOnly 才允许重放，经审核的 IdempotencyParameter 配合 CompletionCheck 才开启同业务键重试。参数由可信 tenant/request/工具/稳定调用/参数摘要派生并注入，模型不能覆盖。每次连接重新核对声明摘要，MCP isError 不成为成功证据。代码执行提供 status=completed 可信断言，非零退出、超时及 SDK 参数校验不算完成；执行中断仍采用 manual，因为不能从所有沙箱后端推断外部写操作幂等。
 
