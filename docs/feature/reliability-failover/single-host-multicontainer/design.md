@@ -1,5 +1,15 @@
 # 单主机多容器实例可用性 — 设计文档
 
+
+## 本能力的全量数据与接口索引
+
+当前代码基线为 `0f53489`。本篇解释本能力的结构、字段用途和竞态；共同字段以[有效迁移合并后的数据库字典](../DATABASE.md)为准，含类型、默认、空值、主/外键、CHECK及索引。不能只读000001中的最初CREATE而漏掉后续ALTER。
+
+直接关联表：[`tenant`](../DATABASE.md#tenant)、[`config_snapshot`](../DATABASE.md#config_snapshot)、[`channel_binding`](../DATABASE.md#channel_binding)、[`execution_record`](../DATABASE.md#execution_record)、[`session_head`](../DATABASE.md#session_head)、[`outbox`](../DATABASE.md#outbox)、[`execution_attempt`](../DATABASE.md#execution_attempt)、[`task_plan`](../DATABASE.md#task_plan)、[`delivery_ledger`](../DATABASE.md#delivery_ledger)、[`delivery_receipt`](../DATABASE.md#delivery_receipt)、[`webui_message`](../DATABASE.md#webui_message)、[`backend_binding`](../DATABASE.md#backend_binding)、[`backend_profile_revision`](../DATABASE.md#backend_profile_revision)。
+
+[内部对象和精确接口](../INTERFACES.md)覆盖加密JSON中的目标/计划/检查点/候选、跨Redis的envelope/reply、所有真实HTTP参数与启动配置；[完整数据链路](../END-TO-END-DATA-FLOW.md)逐步说明哪些在同事务、何时可ACK及故障后读哪份事实。表外的Redis键、SDK app_name与秘密AAD同样属于实现契约。
+
+
 ## 状态的归属、是否持久与重启行为
 
 | 状态 | 权威位置 | 重启后行为 | 隔离要求 |

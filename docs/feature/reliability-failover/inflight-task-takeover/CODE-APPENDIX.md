@@ -1,5 +1,7 @@
 # 在途任务接管与幂等投递 — 实现代码附录
 
+完整实现阅读基线：`0f53489`；[实现历程](../IMPLEMENTATION-HISTORY.md)、[有效表字段/约束](../DATABASE.md)、[接口/配置](../INTERFACES.md)、[逐阶段读写与恢复](../END-TO-END-DATA-FLOW.md)。本篇继续保留相应层级的精确代码/DDL或判据，不将它们当作实际部署执行结果。
+
 ## local_note 业务事实读取与同键结果认证
 
 来源：`trpcservice/tool/localnote/postgres/store.go`，完整文件。本文件完整展示 Create/Lookup 共用的 AES-GCM 认证路径。同键重试返回原密文结果，不能回显未核验的入参；原 key_version 保留后可跨轮换读取。
@@ -1151,9 +1153,23 @@ func (s *TaskStore) RecordModelRequest(ctx context.Context, key gateway.Executio
 来源：`trpcservice/channels/delivery/service.go`；只有可信查询结果允许重试；unknown 有界核对后进入 failed/reconcile_exhausted。
 
 ```go
-func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record messaging.DeliveryRecord) error {
+func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record messaging.DeliveryRecord, contentDigest string) error {
 	if record.NotBefore.After(time.Now()) {
 		return DeferredError{NotBefore: record.NotBefore}
+	}
+	if receipts := s.receiptStore(); receipts != nil {
+		r, err := receipts.GetProviderReceipt(ctx, record.DeliveryKey)
+		if err == nil {
+			if !receiptMatches(r, record, event, contentDigest) {
+				return s.deferReconciliation(ctx, record, runtime.ErrVersionMismatch)
+			}
+			record.State, record.ProviderMessageID, record.LastErrorClass = messaging.DeliverySent, r.ProviderMessageID, "provider_receipt_recovered"
+			_, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version)
+			return err
+		}
+		if !errors.Is(err, runtime.ErrNotFound) {
+			return s.deferReconciliation(ctx, record, err)
+		}
 	}
 	adapter, err := s.resolveAdapter(ctx, event)
 	if err != nil {
@@ -1163,7 +1179,7 @@ func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record
 	if !ok {
 		return s.deferReconciliation(ctx, record, runtime.ErrCapabilityUnsupported)
 	}
-	result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: record.ClientRequestID})
+	result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: record.ClientRequestID, ContentDigest: contentDigest})
 	if err != nil {
 		return s.deferReconciliation(ctx, record, err)
 	}
@@ -1245,9 +1261,23 @@ func (s *Store) ResolveUncertainDelivery(ctx context.Context, in DeliveryResolut
 SET state=$5,provider_message_id=NULLIF($6,''),last_error_class=$7,not_before=now(),version=version+1,updated_at=now()
 WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$4
 AND (state='ambiguous' OR (state='failed' AND last_error_class='reconcile_exhausted'))
+AND NOT EXISTS (SELECT 1 FROM delivery_receipt r WHERE r.tenant_id=$1 AND r.delivery_key=$2 AND r.segment_no=$3
+AND ($5<>'sent' OR r.provider_message_id IS DISTINCT FROM NULLIF($6,'')))
 RETURNING version`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion, state, in.ProviderMessageID, class).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
-		return runtime.ErrVersionConflict
+		var prior DeliveryResolution
+		err = tx.QueryRowContext(ctx, `SELECT actor,evidence_ref,decision,COALESCE(provider_message_id,'') FROM delivery_resolution
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND expected_version=$4`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion).Scan(&prior.Actor, &prior.EvidenceRef, &prior.Decision, &prior.ProviderMessageID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtime.ErrVersionConflict
+		}
+		if err != nil {
+			return err
+		}
+		if prior.Actor != in.Actor || prior.EvidenceRef != in.EvidenceRef || prior.Decision != in.Decision || prior.ProviderMessageID != in.ProviderMessageID {
+			return runtime.ErrIdempotencyCollision
+		}
+		return tx.Commit()
 	}
 	if err != nil {
 		return err

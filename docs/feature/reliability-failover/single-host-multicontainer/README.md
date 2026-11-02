@@ -1,10 +1,21 @@
 # 单主机多容器实例可用性
 
+
+## 从头到尾的完整阅读路径
+
+1. [概念与边界](OVERVIEW.md)，明确保护对象和实际模式。
+2. [完整实例生命周期与机制讲解](FULL-GUIDE.md#连贯讲解两个容器如何成为可接管的同一套服务)：依次讲共享与隔离、启动就绪、入口摘除、职责接管、重新加入、排空与负载；再读[全部提交/迁移历程](../IMPLEMENTATION-HISTORY.md)。
+3. [30阶段数据链路](../END-TO-END-DATA-FLOW.md)，逐步核对事务与故障责任。
+4. [本能力设计](design.md) + [65张表的字段字典](../DATABASE.md) + [HTTP/内部对象/配置](../INTERFACES.md)。
+5. [运行走读](implementation-walkthrough.md)→[代码证据](CODE-APPENDIX.md)→[精确参考实现](REFERENCE-IMPLEMENTATION.md)。
+6. [判据](testing-and-acceptance.md)与[发布运维](release-and-operations.md)，区分代码机制和真实环境证据。
+
+
 保护同一主机内两个应用实例的共存、独立身份、强杀后的存活实例接管、重新加入和反向故障。两个实例共同使用一份数据库、队列和协调服务。
 
 ## 当前实现状态与阅读顺序
 
-正文按当前工作区的迁移000001–000004、运行时、入口与Compose配置编写。CURRENT-IMPLEMENTATION仅提供摘要；各篇正文直接给出当前机制，不通过“历史与基线冲突时覆盖”维持两套说法。
+正文按当前工作区的迁移000001–000008、运行时、入口与Compose配置编写。CURRENT-IMPLEMENTATION仅提供摘要；各篇正文直接给出当前机制，不通过“历史与基线冲突时覆盖”维持两套说法。
 
 | 文件 | 层级 | 负责回答 | 读者与可跳过范围 |
 |---|---|---|---|

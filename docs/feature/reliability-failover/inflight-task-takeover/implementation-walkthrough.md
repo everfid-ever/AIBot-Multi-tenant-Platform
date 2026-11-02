@@ -1,5 +1,22 @@
 # 在途任务接管与幂等投递 — 实现走读
 
+## 先按恢复决策读代码
+
+| 当前持久事实 | 第一入口 | 后续动作 |
+|---|---|---|
+| 只有Inbox/job/dispatch工作 | preprocess.Worker / DispatchRelay / Consumer | 原request回收，不能靠用户重发 |
+| 工具结果存在但步骤未成功 | taskflow.Recover / verifyTool | 原操作、参数、工具版本、摘要和全部断言核验后补检查点 |
+| tool effect_unknown | GuardedCallable/RecoveryPolicy | 原键查询、原幂等键或manual停止；pending不是没写入 |
+| execution_completion存在 | recoverCompletion → resumeCompletion | 认证原候选和PlanDigest，复用审核/预约/用量，跳过新模型 |
+| 旧公开结果存在、无候选 | 原结果兼容恢复 | 校验冻结内容和密钥，继续Seal/commit；矛盾审计失败 |
+| 计划sealed但缺结果 | commitRecoveryFailure | 保留矛盾证据，不生成另一个答案覆盖 |
+| 无完成事实且计划open | BeginAttempt → SDK | 原预算、历史和恢复摘要指导继续工作 |
+| terminal/Outbox已提交 | ReplyRelay/Delivery | 原结果、目标和分段计划投递，不重跑模型/工具 |
+| ambiguous且回执匹配 | Delivery.reconcile | 只补sent；无回执才进行真实外部核对 |
+
+完整函数签名、字段和条件在[接口册](../INTERFACES.md)；每个阶段的独立事务及kill后的权威材料在[完整链路](../END-TO-END-DATA-FLOW.md)。业务笔记的原参数绑定与读回不是另一套执行器，沿同一Guard、计划、结果及投递链运行。
+
+
 ## 具体业务的新增执行顺序
 
 明确 `/note` 输入 → 首次 TaskRequirements 冻结精确工具、规范参数摘要和 note_id 要求 → 模型定义覆盖步骤 → 原确认流程 → BeforeTool 检查参数及冻结 trusted_outputs → 原业务键创建或查询恢复 → receipt 基础断言与标量字段核验 → VerifyBusinessResult 独立查询业务表并逐项比对 → Complete 保存工具成功 → RecordTool → ValidateFinal 核对真实编号 → 原候选、结算、冻结和终态链路。

@@ -1,5 +1,7 @@
 # 故障恢复后继续对话 — 实现代码附录
 
+完整实现阅读基线：`0f53489`；[实现历程](../IMPLEMENTATION-HISTORY.md)、[有效表字段/约束](../DATABASE.md)、[接口/配置](../INTERFACES.md)、[逐阶段读写与恢复](../END-TO-END-DATA-FLOW.md)。本篇继续保留相应层级的精确代码/DDL或判据，不将它们当作实际部署执行结果。
+
 ## 权威终态的模型上下文投影
 
 来源：`trpcservice/worker/terminal_history.go`，完整文件。核对原输入/身份/附件与精确结果引用，拒绝把草稿或未审核输入重新引入模型。对应 worker/terminal_history_test.go。
@@ -435,10 +437,6 @@ func TenantKey(tenantID, agentAppID, userID, sessionID string) session.Key {
 	}
 }
 
-// ParseTenantApp decodes tenantID / agentAppID from an official app_name.
-// It returns ok=false for any malformed value (empty segment, missing
-// separator, or an extra separator); callers must fail closed on ok=false.
-
 func TenantGetSessionHook(tenantID, agentAppID string) session.GetSessionHook {
 	want := tenantID + TenantAppSep + agentAppID
 	return func(ctx *session.GetSessionContext, next func() (*session.Session, error)) (*session.Session, error) {
@@ -448,12 +446,6 @@ func TenantGetSessionHook(tenantID, agentAppID string) session.GetSessionHook {
 		return next()
 	}
 }
-
-// NewOfficialSessionService builds the shared official session/postgres
-// backend used by a Worker role. Tenant scope is enforced by the per-turn
-// facade, not by a process-wide static hook: one Worker legitimately serves
-// multiple tenant/app pairs. DB init is skipped so table creation stays under
-// the platform migration authority rather than the SDK's implicit DDL.
 
 func NewOfficialSessionService(dsn string) (*sessionpostgres.Service, error) {
 	if strings.TrimSpace(dsn) == "" {
@@ -469,10 +461,6 @@ func NewOfficialSessionService(dsn string) (*sessionpostgres.Service, error) {
 	}
 	return svc, nil
 }
-
-// NewTenantScopedOfficialSessionService is retained for single-scope callers
-// such as narrowly scoped maintenance jobs. Multi-tenant process roles must
-// use NewOfficialSessionService and the checked BufferedTurn facade instead.
 ```
 
 ## fence 校准与获取
@@ -593,6 +581,22 @@ func (w RunnerExecutor) commitFrozenSuccess(ctx context.Context, turn *sessionst
 			return err
 		}
 	}
+	if task := taskflow.FromContext(ctx); task != nil {
+		results, ok := w.Payloads.(messaging.ResultStore)
+		if !ok {
+			return runtime.ErrCapabilityUnsupported
+		}
+		frozen, err := results.GetResult(ctx, envelope.TenantID, envelope.RequestID)
+		if err != nil {
+			return err
+		}
+		if frozen.ResultRef != resultRef {
+			return runtime.ErrVersionMismatch
+		}
+		if err := task.SealFinal(ctx, resultRef, frozen.Content); err != nil {
+			return err
+		}
+	}
 	replyID, err := messaging.StableReplyID(messaging.ReplyCoordinate{
 		TenantID: envelope.TenantID, RequestID: envelope.RequestID,
 		InputSeq: envelope.InputSeq, Stage: "terminal", Ordinal: 0,
@@ -616,10 +620,6 @@ func (w RunnerExecutor) commitFrozenSuccess(ctx context.Context, turn *sessionst
 	}
 	return err
 }
-
-// CancelWithLease turns a durable cancellation intent into the only
-// authoritative cancelled terminal: a fenced CommitTurn that advances the
-// session input gate and emits an audit fact.
 ```
 
 ## 排空不被成功轮询复活

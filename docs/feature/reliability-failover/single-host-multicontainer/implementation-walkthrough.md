@@ -1,5 +1,22 @@
 # 单主机多容器实例可用性 — 实现走读
 
+## 按容器与进程顺序走完生命周期
+
+| 阶段 | 实际读写/控制 | 权威与失败含义 |
+|---|---|---|
+| 1. 依赖与bootstrap | PG迁移至008，Redis/ClamAV/Qdrant等本地依赖就绪；引导控制面/不可变文件 | bootstrap先完成；运行实例仍做幂等校验，SKILLS_READ_ONLY不代表DB只读 |
+| 2. 启动身份 | 校验InstanceID，随机ProcessStartID，生成各role owner | owner含启动代次；实例名无全局唯一表约束，部署须配置清楚 |
+| 3. 资源隔离 | 只读root、私有tmpfs、各自映射端口、只读技能卷 | 相同目录字符串在不同容器内可以对应独立空间 |
+| 4. 角色进入运行 | 预处理/Relay/Worker/Wakeup/Delivery/确认到期等分别开始真实轮询 | starting不等于ready；组件异常会影响就绪/运行 |
+| 5. 入口加入 | ready探测、新鲜度和恢复阈值 | 不因名称或启动完成就假定可承载业务 |
+| 6. 节点强杀 | 无defer清理；外部回调转存活实例，PEL/claim/lease回收 | 不依赖重启受害节点，不手删租约 |
+| 7. 同名重启 | 产生新ProcessStartID，旧工作按共享状态处理 | 不继承旧消费/领取能力，不重放已确认段 |
+| 8. 计划停止 | health.beginDrain→Gate.Begin→停新读取/HTTP Shutdown→等待活动工作 | 不立即取消workCtx；超时最终取消，未完工作仍可回收 |
+| 9. 结束 | 原owner不能越过Fence/版本覆盖；原目标/结果不变 | “容器退出”与“原业务完成”分别取证 |
+
+当前Delivery每实例都可启动账号流消费者，依靠Redis group和逐段claim控制重复，不存在一个全局独占Bot WebSocket owner。接管业务事实追到[数据库字典](../DATABASE.md)，所有HTTP/默认期限追到[接口册](../INTERFACES.md)。
+
+
 ## 从部署对象到运行角色的启动顺序
 
 | 阶段 | 运行时行为 | 尚不能得出的结论 |

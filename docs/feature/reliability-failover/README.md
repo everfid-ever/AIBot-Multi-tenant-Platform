@@ -1,91 +1,76 @@
-# 三项可靠性能力
+# 三项可靠性能力：完整实现文档
 
-本轮在途能力补充原参数绑定的笔记业务、独立读回及真实编号校验，并提供稳定主键分页；详见[业务与分页设计](inflight-task-takeover/design.md#具体业务闭环原始笔记参数独立读回与真实编号)。
+**代码基线：`0f53489`，数据库迁移至 `000008_delivery_receipt`，SDK 以 go.mod 中 v1.11.2 为准。** 文档描述已存在的代码及其前提，不将未执行的真实部署/供应商故障验收写成通过结论。
 
-当前在途能力新增发布前条件校验、结构化恢复摘要与按原请求查询任务元数据，详见[在途设计](inflight-task-takeover/design.md#发布前校验恢复摘要与任务详情)。本轮无新数据库迁移。
+## 从哪里开始
 
-所有能力文档按 [四个深度级别与二十个审查角度](DOCUMENTATION-METHOD.md) 组织。每个能力的 README 提供文件地图以及 A1–A20 的“为什么必须有、提问式判据、文档位置”。L1–L4 正文已按当前迁移、运行时和 Compose 重新组织，CURRENT-IMPLEMENTATION 仅作摘要，各层正文直接说明当前实现。
-
-## 当前实现状态
-
-当前发送链路增加 `000008_delivery_receipt`：持久回执支持 P4 部分窗口自动确认；未知错误不自动补发，分段失败阻断后续段。管理接口增加事件详情查询，处置支持幂等重试与成功回执保护。详见 [P4 数据与状态](inflight-task-takeover/design.md#000008p4-持久回执保守判定与受控处置)。发布须先执行 000008；渠道接受到 journal 落库前的窗口仍按真实协议和证据处置。
-
-工具侧已增加 idempotent_key 的查询优先恢复：实际 local_note 从业务表认证原结果并修复检查点，MCP 可配置审核后的同端点状态查询和 JSON 文本回执解析；可信完成断言在成功入账前及结果复用时执行。详见[工具状态与协议](inflight-task-takeover/design.md#状态查询优先与可信回执前置校验)。本轮无新增数据库迁移，未知写操作与代码执行中断仍保守处理。
-
-`000007_execution_completion` 补齐治理结算与结果提交之间的恢复窗口：先保存加密的完成候选及已审核决定，再幂等结算、晋升公开结果并提交终态。接管交叉验证候选、计划和公开结果，不重新申请已关闭预约；矛盾状态保留证据并失败收敛。会话读取视图按原 request/Fence 整理当前尝试，并按权威终态重建过去最多 100 轮原输入/最终结果；MCP 与代码执行适配器补充明确的恢复/完成证据契约。字段与边界见[完成候选设计](inflight-task-takeover/design.md#000007完成候选与治理结算恢复)。部署迁移需执行至 000008。
-
-步骤级恢复由 `000005_task_checkpoints` 与 `000006_task_failure_convergence` 提供。当前本地 WebUI/WeCom 共享组合根启用加密计划、版本化检查点、强制非空计划准入、工具操作与证据绑定、持久化有界重试，以及成功/失败终态的可靠投递。详见[步骤数据模型](inflight-task-takeover/design.md)与[运行顺序](inflight-task-takeover/implementation-walkthrough.md)。自定义 RunnerExecutor/Factory 调用者需要同时装配对应 Store 和工具开关，不能仅执行迁移就声称所有运行入口启用。启用 TaskPlans 的普通纯文本请求也须创建计划，不能以空计划绕过完成门禁。
-
-### 按问题定位详细说明
-
-| 想弄清楚的问题 | 首选文档 | 接着核对 |
-|---|---|---|
-| 换节点为什么仍是原会话、两个 Bot 为什么不混？ | [会话机制](conversation-continuity/FULL-GUIDE.md) | [身份键、读取条件与字段设计](conversation-continuity/design.md) |
-| 历史保存了却回答不对，该查哪一层？ | [会话走读](conversation-continuity/implementation-walkthrough.md) | [历史与路由排障](conversation-continuity/release-and-operations.md) |
-| 原输入在任一阶段崩溃后，究竟由谁继续？ | [在途责任转移与故障推演](inflight-task-takeover/FULL-GUIDE.md) | [事务和不变量](inflight-task-takeover/design.md) |
-| 工具执行一半、外部已写成功、平台没记下怎么办？ | [工具六个检查点与恢复策略](inflight-task-takeover/FULL-GUIDE.md) | [实际执行顺序](inflight-task-takeover/implementation-walkthrough.md) |
-| 唯一终态、唯一 Ledger 行、只见一条答案分别是什么意思？ | [计数与分段交付边界](inflight-task-takeover/design.md) | [证据和反例](inflight-task-takeover/testing-and-acceptance.md) |
-| P4 无法判定、自动核对结束后怎么处理？ | [在途运维操作单](inflight-task-takeover/release-and-operations.md) | [真实处置接口与 SQL](inflight-task-takeover/CODE-APPENDIX.md) |
-| 两容器共存、重新加入和反向故障为什么安全？ | [多容器故障域与生命周期](single-host-multicontainer/FULL-GUIDE.md) | [状态归属与准入竞态](single-host-multicontainer/design.md) |
-| ready、入口健康、执行资格为何不等价？ | [多容器运行时走读](single-host-multicontainer/implementation-walkthrough.md) | [故障当班与容量处置](single-host-multicontainer/release-and-operations.md) |
-| 如何证明没有通过重启、重发或换会话绕过问题？ | [会话验收](conversation-continuity/testing-and-acceptance.md)、[在途验收](inflight-task-takeover/testing-and-acceptance.md) | [实例职责与轮次矩阵](single-host-multicontainer/testing-and-acceptance.md) |
-
-各能力继续沿用 README、L1–L4 文件结构。L2 用业务故事、责任转移和反例解释原因；L3 给真实字段、算法条件与运行顺序；L4 区分实现证据、环境证据与外部事实。REFERENCE-IMPLEMENTATION 保留精确 DDL/代码契约，字段理解优先读 design 中的表格。
-
-### 贯穿三项能力的阅读约定
-
-- “自动接管”指在共享依赖和恢复契约满足时，由存活角色依据持久事实推进；不是转移旧 goroutine、任意工具函数栈或模型内部生成状态。
-- “持久化”指保存了可恢复事实，不表示所有表、Redis 操作和外部效果在一个事务内；每一处跨边界窗口都要单独解释。
-- “安全”与“自动完成”分别判断：保留 tool_effect_unknown 或 ambiguous 可避免盲重放，但不等于该任务已经成功或答案已经送达。
-- “历史可读取”与“模型正确回忆”分别取证：存储存在不证明所有历史已进入本次模型上下文。
-- “支持验收路径”表示有步骤、观测和判据，不把未实际执行的持续负载、真实渠道和容量指标写成通过结果。
-
-三项能力均已落入同一套共享运行时：PostgreSQL 保存权威业务状态，Redis 提供会话与任务协调，Worker/Relay/Delivery 以独立节点身份竞争可回收的工作。节点失效不会把内存状态当作恢复依据；接管者只依据持久化记录、租约和 Fencing Token 行动。
-
-| 文档包 | 内容 |
+| 要回答的问题 | 连贯阅读入口 |
 |---|---|
-| [会话连续性](conversation-continuity/README.md) / [当前基线](conversation-continuity/CURRENT-IMPLEMENTATION.md) | 身份链路、会话 ownership、双 Bot tenant 隔离和故障续办 |
-| [在途任务接管](inflight-task-takeover/README.md) / [当前基线](inflight-task-takeover/CURRENT-IMPLEMENTATION.md) | P1–P4、lease/fence、Outbox/Ledger、工具恢复协议 |
-| [多容器 HA](single-host-multicontainer/README.md) / [当前基线](single-host-multicontainer/CURRENT-IMPLEMENTATION.md) | Compose 拓扑、入口、身份、强杀接管、重加入与反向故障 |
+| 这三个能力究竟保护什么、边界是什么 | 各能力 OVERVIEW；见下方文档地图 |
+| 想先读懂每项能力的完整工作过程 | 三篇 FULL-GUIDE 的“连贯讲解”：原会话续聊故事、创建笔记长任务、双实例生命周期，先理解因果再查字段 |
+| 从最初持久化到现在，为什么一层层补成这样 | [实现历程](IMPLEMENTATION-HISTORY.md)，按真实提交/迁移解释缺口和演进 |
+| 一条消息从入口到最终答案，每一步由谁负责 | [完整数据链路](END-TO-END-DATA-FLOW.md)，30个阶段、7类独立事务和各故障分支 |
+| 所有相关表、字段、默认值、主外键与索引 | [数据库字典](DATABASE.md)，65张相关表、789个字段，合并后续 ALTER 后解释 |
+| HTTP参数、内部接口、加密对象、配置与启动顺序 | [接口与配置](INTERFACES.md)，实际挂载入口、58个相关 Go 合同、80个关键对象逐字段说明 |
+| 想核对某个不变量的真实代码/DDL | 各能力 design / CODE-APPENDIX / REFERENCE-IMPLEMENTATION |
+| 怎样判断成功、失败、未知和人工处置 | 各能力 testing-and-acceptance / release-and-operations |
 
-| 能力 | 关键事实 | 当前实现 |
+数据库字典和接口册是三个能力共用的 L3 参考，避免同一张表在三个目录出现三种定义；每个能力的 design 给出自己使用的字段/状态含义。原 L1–L4 文件结构保留。
+
+## 三项能力的当前范围
+
+| 能力 | 已落入代码的主链路 | 保留的前提与边界 |
 |---|---|---|
-| 故障后继续对话 | 租户、Bot Binding、会话和外部消息身份 | 持久化路由、输入、会话提交和回复路由；双 WeCom Bot 使用不同 tenant、binding、app 和密钥作用域 |
-| 在途任务接管与幂等投递 | 输入、执行、提交、投递和工具副作用 | Inbox/Outbox、会话 lease/fence、队列 reclaim、Delivery Ledger、工具执行租约与恢复策略 |
-| 单主机多容器 HA | 多节点身份和共享协调资源 | Compose 双节点、稳定回调入口、独立端口与 `process_start_id`，单节点 SIGKILL 后由对端接管 |
+| [故障恢复后继续对话](conversation-continuity/README.md) | 可信 Bot Binding、稳定 tenant/user/session、Inbox 原消息链、平台顺序与 SDK 状态分工、权威终态历史、原回复路由 | 共享依赖/原配置密钥可用；最多100个输入终态的读取窗口，不承诺任意模型无限/完全记忆 |
+| [在途任务接管与幂等投递](inflight-task-takeover/README.md) | 原请求回收、lease/Fence、任务计划/预算/检查点、可信工具结果/业务读回、完成候选、终态/Outbox、分段 Ledger/回执与处置 | 工具/渠道的外部效果需真实幂等或查询契约；未知不能谎报成功；P4 接受到回执落库前仍有协议边界 |
+| [单主机多容器高可用](single-host-multicontainer/README.md) | 共享数据库/队列、实例与启动身份、私有本地状态、稳定 callback 入口、业务 ready、强杀回收、重加入、反向故障、有限排空 | 应用实例故障域；同机断电/内核/Docker/共享PG或Redis/唯一入口整体故障不由双应用副本消除 |
 
-## 共享执行链路
+当前 WeCom 是 **HTTP callback + 官方发送 API**。没有迁移 Bot WebSocket 主连接的实现；入口转发、Worker 会话 lease 和 Delivery segment claim 分别控制自己的责任。两个 Bot 属于不同租户与绑定，存活应用实例须能处理两者，不能用两个互不共享业务状态的完整环境替代接管。
 
-```text
-已验签 Bot Binding
-  -> Inbox / Payload / ReplyRoute
-  -> preprocess job / broker delivery
-  -> session lease + fence
-  -> model / durable tool execution (allow + ask)
-  -> terminal session commit + Outbox
-  -> reply relay
-  -> Delivery Ledger
-  -> 外部渠道最终回复
+## 各能力 L1–L4 文档地图
+
+| 级别 / 文件 | 会话连续性 | 在途任务 | 单机多容器 | 内容职责 |
+|---|---|---|---|---|
+| 导航 README | [入口](conversation-continuity/README.md) | [入口](inflight-task-takeover/README.md) | [入口](single-host-multicontainer/README.md) | 范围、角色与A1–A20问题定位 |
+| 当前基线 CURRENT-IMPLEMENTATION | [基线](conversation-continuity/CURRENT-IMPLEMENTATION.md) | [基线](inflight-task-takeover/CURRENT-IMPLEMENTATION.md) | [基线](single-host-multicontainer/CURRENT-IMPLEMENTATION.md) | 当前代码状态，禁止把旧里程碑当最新结论 |
+| L1 OVERVIEW | [概念](conversation-continuity/OVERVIEW.md) | [概念](inflight-task-takeover/OVERVIEW.md) | [概念](single-host-multicontainer/OVERVIEW.md) | 场景、承诺、数字和不包含项 |
+| L2 FULL-GUIDE | [机制](conversation-continuity/FULL-GUIDE.md) | [机制](inflight-task-takeover/FULL-GUIDE.md) | [机制](single-host-multicontainer/FULL-GUIDE.md) | 演进因果、故障瞬间、为什么单做某一层不够 |
+| L2→L3 design | [设计](conversation-continuity/design.md) | [设计](inflight-task-takeover/design.md) | [设计](single-host-multicontainer/design.md) | 本能力模型、真实字段、状态/竞态和不变量 |
+| L3 implementation-walkthrough | [运行走读](conversation-continuity/implementation-walkthrough.md) | [运行走读](inflight-task-takeover/implementation-walkthrough.md) | [运行走读](single-host-multicontainer/implementation-walkthrough.md) | 按运行时顺序追 durable truth 与 kill 后动作 |
+| L3 CODE-APPENDIX | [代码证据](conversation-continuity/CODE-APPENDIX.md) | [代码证据](inflight-task-takeover/CODE-APPENDIX.md) | [代码证据](single-host-multicontainer/CODE-APPENDIX.md) | 真实代码、状态变化及故障意义 |
+| L3 REFERENCE-IMPLEMENTATION | [精确契约](conversation-continuity/REFERENCE-IMPLEMENTATION.md) | [精确契约](inflight-task-takeover/REFERENCE-IMPLEMENTATION.md) | [精确契约](single-host-multicontainer/REFERENCE-IMPLEMENTATION.md) | 原DDL、接口算法、参数与启动依赖 |
+| L4 testing-and-acceptance | [判据](conversation-continuity/testing-and-acceptance.md) | [判据](inflight-task-takeover/testing-and-acceptance.md) | [判据](single-host-multicontainer/testing-and-acceptance.md) | 故障窗口、证据、反例与独立验收规则 |
+| L4 release-and-operations | [运维](conversation-continuity/release-and-operations.md) | [运维](inflight-task-takeover/release-and-operations.md) | [运维](single-host-multicontainer/release-and-operations.md) | 迁移/发布/兼容/回滚与分场景处置 |
+
+建议实现者先通读本能力 OVERVIEW → FULL-GUIDE 的演进和连贯讲解 → 共享完整数据链路 → design + 数据库/接口册 → 运行走读，怀疑某项不变量时再查源码附录和精确DDL。三篇连贯讲解分别串起身份到原路由回复、原任务到可信完成与投递、实例启动到故障与重新加入；后续专题提供更细的竞争和反例。验收者在L1边界之后直接读L4，但必须保留 request/Fence/结果/渠道证据链。
+
+## 同一条链上的三项职责
+
+```mermaid
+flowchart LR
+  C[会话能力: 谁的消息 / 哪个原会话] --> R[在途能力: 谁继续做 / 完成证据 / 如何发送]
+  R --> H[多实例能力: 谁活着 / 谁可接入 / 怎样退出重入]
+  H --> C
 ```
 
-持久化接收先于异步执行，terminal与reply Outbox同事务；工具结果、SDK历史、最终结果冻结和外部发送各有独立窗口。SDK历史写入不能随平台terminal回滚。旧owner的业务提交由fence/version/claim条件限制，外部副作用仍须工具与渠道协议保护。
+当前数据边界不是一个总事务：先加密原载荷，再同事务建立 Inbox/预处理工作；prepare_dispatch 固定原执行与派发 Outbox；工具结果与业务效果分别处理；SDK 原事件可先于平台终态写入；完成候选先于结算；terminal 与回复 Outbox 同事务；最后才对外发送并保存接受回执。每个交接点都由自己的状态、幂等键和恢复协议负责。
 
-最新在途恢复增量由 `000004_inflight_recovery` 提供：独立 Worker 尝试日志、逻辑模型调用与 HTTP 尝试分计数、普通/确认工具统一恢复、原子加密工具结果及真实幂等笔记写入。`p2`/`p4` 端点已调整为模型请求接受后/下游发送接受后，旧边界另名保留；当前精确定义见 [在途任务接管](inflight-task-takeover/README.md)。
+## 计数与“成功”的层次
 
-## 故障承诺与边界
-
-- 单个应用节点失效后，已持久化接收的输入由系统回收或按恢复契约处理，无需用户重发；不可安全重放的工具可收敛为明确失败/效果不确定。
-- 模型调用和任务尝试次数可以因接管增加；Delivery Ledger记录每个分段的有效发送状态，可见回复数另以客户端证据核对。
-- 下游渠道支持可靠请求级去重或可查询时，可将“请求已发出但本地未确认”收敛；否则先保存 ambiguous，核对耗尽可转为 failed/reconcile_exhausted，并通过外部证据处置。Ledger 单行不能证明客户端仅一次可见，不声称无条件 exactly-once。
-- 工具调用不是所有都可安全重放：只有 `replay_safe`、`idempotent_key` 或 `queryable` 契约允许自动续办；`manual` 契约会终止为 `tool_effect_unknown`。
-- 范围是单主机内的应用实例故障。宿主机、Docker daemon、PostgreSQL、Redis 或外部渠道整体不可用不属于本地双实例 HA 承诺。
-
-## 验证入口
-
-| 目标 | 命令 | 覆盖 |
+| 观察量 | 权威来源 | 不可推导的结论 |
 |---|---|---|
-| P1–P4 在途接管 | `bash scripts/e2e/inflight-takeover.sh p2` | 可替换为 `p1`、`p3`、`p4`；命中 barrier 后 SIGKILL owner，由 peer 完成原输入 |
-| WeCom 双节点生命周期 | `bash scripts/e2e/single-host-multicontainer.sh` | N1 强杀、N1 新身份重加入、N2 反向强杀和稳定入口健康检查 |
-| 全量单元/包测试 | `go test ./...` | 运行时、工具恢复、接管与交付回归 |
+| Worker 尝试 | execution_attempt | completed 只表示执行器正常返回，不必然代表业务成功 |
+| 模型逻辑调用 | execution_record.model_call_count | 不代表只发一次供应商 HTTP 请求 |
+| 模型 HTTP 尝试 | model_request_count | 不等于供应商接受/计费次数 |
+| 工具尝试与业务效果 | tool_execution.attempt / 原业务键实际记录 | 多次尝试不等于多个效果，也不能仅凭账本证明未知业务没写入 |
+| 原有效终态 | session_commit + session_head | 不代表渠道已经送达 |
+| 逻辑回复与分段 | reply coordinate / delivery_key / segment | 多个合法段不等于多条重复最终答案 |
+| 发送与接受 | Ledger attempt/state / ProviderReceipt | 本地 sent 或 Provider ID 不单独证明客户端只显示一次 |
+| 用户可见最终回复 | 真实客户端及可关联渠道证据 | 不以流式占位或后续新消息成功替代原消息完成 |
 
-两份 E2E 脚本需要相应 Compose 密钥文件。真实 WeCom 用户会话属于外部渠道验收；脚本验证本地拓扑、接管和持久化语义。
+## 验证入口与文档维护
+
+- 代码回归源及最小证据闭环见各L4文件；真实故障脚本位于 [scripts/e2e](../../../scripts/e2e)。本文不运行或记录实际容器/渠道通过结果。
+- 单位/时间口径、TTL、默认预算、实际端口和启用条件统一在 [接口与配置](INTERFACES.md#环境配置与固定运行参数)；它们不是确定RTO或容量保证。
+- 阅读/审查继续按 [四级深度与20角度](DOCUMENTATION-METHOD.md)。数据库字段须按当前迁移全部ALTER合并；加密JSON和Redis键也属于数据模型。
+- 增量实现要同步其字段/状态/接口/数据链路/故障动作及边界；历史只进入演进表，当前基线不要堆成多段没有时间坐标的“本轮新增”。

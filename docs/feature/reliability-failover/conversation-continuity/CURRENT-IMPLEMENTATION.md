@@ -1,27 +1,21 @@
-# 故障恢复后继续对话 — 当前实现摘要
+# 故障恢复后继续对话 — 当前实现基线
 
-本文是阅读摘要，详细机制、字段、代码及验收分别在同目录L1–L4文档中展开，所有正文使用同一当前实现口径。
+代码基线 `0f53489`；迁移至000008，当前源码中的新增业务合同/引用字段位于原加密Plan内，没有000009。
 
-保护两个独立 Bot 的租户归属、原会话上下文、请求身份与回复目的地。故障发生在一轮已完成之后，再发送新消息验证会话连续性；处理中的旧消息另按在途接管判定。
+## 当前权威链路
 
-## 身份、历史与恢复
+- 可信 Binding 固定 tenant/app/account；身份/会话密钥和渠道坐标派生稳定 user/session。
+- ingress.Pipeline 先保存加密输入，再同事务建立 Inbox 与预处理工作；原消息键不因重试变化。
+- 平台 session_head/commit 负责输入顺序、Fence和终态；官方 SDK session_events/state 保存原执行转写，两域不是一个事务。
+- Worker 读取最近最多100个原会话终态，认证原成功输入、原用户/会话、固定结果和密钥版本；未提交/被拒绝草稿不当作历史答案。
+- 新消息完成后，原执行配置和 Inbox 目标构成 ReplyRoute；跨租户或目标不匹配拒绝，旧结果/候选不被重新生成覆盖。
 
-当前 Worker 为 SDK 事件标记可信 root request/Fence，整理当前尝试及准确批准的确认调用；过去轮次改由 session_commit + 原输入 + 精确结果引用构造终态投影，不再按最高 Fence 推断有效答案。最近最多 100 个 terminal 按输入顺序进入读取副本；未提交草稿、失败前的成功宣称及未审核输入不被当作已完成历史。原始事件和 SDK State 保留，不宣称跨库原子回滚。治理结算中断则从加密 execution_completion 复用原审核决定与答案，避免关闭预约后重新 Begin 失败。
+## 接管与边界
 
-可信Binding固定tenant/app/account，HMAC派生user/session；Inbox按原渠道消息去重，ReplyRoute冻结。SDK session_events保存原始执行转写；模型的过去上下文由原输入、terminal与结果引用共同裁定，平台head/commit负责顺序、fence和Outbox。SDK写入与平台terminal事务独立，不能回滚已写SDK事件。Worker校准fence、reclaim原工作，已冻结答案直接续提交，原会话新消息从共享历史继续。
+callback 入口只向 ready 后端转发；Worker reclaim、会话 lease/Fence 与 Delivery Ledger 各自负责旧工作。单实例恢复不需要换会话或用户重新发送已可靠接收的原输入。模型/HTTP/工具尝试可增加，原有效终态与逻辑回复仍保持原坐标。
 
-## 共同计数与投递边界
+P4 已保存匹配回执时只补 sent；未保存回执且渠道不可可靠查询时保留不确定并走审计处置。这里不声称无条件最终可见恰好一次、无限记忆或已完成真实环境验收。
 
-| 计数 | 权威记录 | 解释 |
-|---|---|---|
-| Worker 尝试 | `execution_attempt` 的行数 / `attempt_no` | 每次进入执行器一行；新尝试把旧 `running` 标为 `superseded`。completed 仅表示执行器正常返回。 |
-| 逻辑模型调用 | `execution_record.model_call_count` | 进入模型适配器的逻辑调用，可因恢复增加。 |
-| 模型 HTTP 尝试 | `execution_record.model_request_count` | transport 尝试，含连接失败及内部重试；不等于接受数或计费数。 |
-| 工具尝试 / 业务效果 | `tool_execution.attempt` / 外部业务幂等记录 | 同键工具重试可大于一次，业务效果应按工具契约去重。 |
-| 回复发送 / 用户可见答案 | Ledger `attempt`、`segment_no/count` / 客户端证据 | 一条答案可有多个分段；唯一 Ledger 行不能单独证明用户只见一次。 |
+## 逐层核对
 
-内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。P4 中若匹配的 provider receipt 已落库，可直接补齐 Ledger；回执也未落库的剩余窗口仍需下游可靠去重/查询或外部处置证据。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
-
-## 详细文档
-
-见 [概念](OVERVIEW.md)、[机制](FULL-GUIDE.md)、[字段与状态](design.md)、[运行走读](implementation-walkthrough.md)、[代码](CODE-APPENDIX.md)、[参考实现](REFERENCE-IMPLEMENTATION.md)、[验收](testing-and-acceptance.md)、[运维](release-and-operations.md)。
+[完整数据链路](../END-TO-END-DATA-FLOW.md) · [实现历程](../IMPLEMENTATION-HISTORY.md) · [表字段](../DATABASE.md) · [接口与配置](../INTERFACES.md) · [机制](FULL-GUIDE.md) · [运行走读](implementation-walkthrough.md) · [状态设计](design.md) · [代码](CODE-APPENDIX.md) · [精确契约](REFERENCE-IMPLEMENTATION.md) · [验收](testing-and-acceptance.md) · [运维](release-and-operations.md)。

@@ -1,5 +1,15 @@
 # 在途任务接管与幂等投递 — 设计文档
 
+
+## 本能力的全量数据与接口索引
+
+当前代码基线为 `0f53489`。本篇解释本能力的结构、字段用途和竞态；共同字段以[有效迁移合并后的数据库字典](../DATABASE.md)为准，含类型、默认、空值、主/外键、CHECK及索引。不能只读000001中的最初CREATE而漏掉后续ALTER。
+
+直接关联表：[`inbox`](../DATABASE.md#inbox)、[`preprocess_job`](../DATABASE.md#preprocess_job)、[`execution_record`](../DATABASE.md#execution_record)、[`execution_attempt`](../DATABASE.md#execution_attempt)、[`task_plan`](../DATABASE.md#task_plan)、[`task_checkpoint`](../DATABASE.md#task_checkpoint)、[`execution_completion`](../DATABASE.md#execution_completion)、[`tool_execution`](../DATABASE.md#tool_execution)、[`tool_execution_result`](../DATABASE.md#tool_execution_result)、[`local_note`](../DATABASE.md#local_note)、[`confirmation`](../DATABASE.md#confirmation)、[`confirmation_grant`](../DATABASE.md#confirmation_grant)、[`tool_attempt`](../DATABASE.md#tool_attempt)、[`tool_result_payload`](../DATABASE.md#tool_result_payload)、[`budget_reservation`](../DATABASE.md#budget_reservation)、[`governance_decision`](../DATABASE.md#governance_decision)、[`usage_ledger`](../DATABASE.md#usage_ledger)、[`result_payload`](../DATABASE.md#result_payload)、[`outbox`](../DATABASE.md#outbox)、[`delivery_ledger`](../DATABASE.md#delivery_ledger)、[`delivery_receipt`](../DATABASE.md#delivery_receipt)、[`delivery_resolution`](../DATABASE.md#delivery_resolution)。
+
+[内部对象和精确接口](../INTERFACES.md)覆盖加密JSON中的目标/计划/检查点/候选、跨Redis的envelope/reply、所有真实HTTP参数与启动配置；[完整数据链路](../END-TO-END-DATA-FLOW.md)逐步说明哪些在同事务、何时可ACK及故障后读哪份事实。表外的Redis键、SDK app_name与秘密AAD同样属于实现契约。
+
+
 ## 具体业务闭环：原始笔记参数、独立读回与真实编号
 
 本轮选择现有持久化笔记作为具体业务场景，没有宣称已接入任意外部工单、付款或 ERP 服务。业务数据位于共享数据库的 local_note，与工具执行账本和 SDK 历史分开；注册及读回均保持原租户作用域。

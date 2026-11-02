@@ -1,5 +1,21 @@
 # 故障恢复后继续对话 — 实现走读
 
+## 先沿原会话走完一遍
+
+| 顺序 | 实际函数/模块 | 读什么 / 写什么 | 此处退出或异常后 |
+|---|---|---|---|
+| 1 | ingress.Service.VerifyAndDecode | 候选、验证回执、VerifiedBinding | 未验签不赋可信tenant |
+| 2 | identity.Mapper.Map | 固定秘密，HMAC用户/会话 | 新节点得到相同坐标，不使用实例ID |
+| 3 | ingress.Pipeline / ClaimInboxAndSchedule | 原加密payload；Inbox+job事务 | 已接收工作可回收，重复callback不造第二request |
+| 4 | Dispatcher / prepare_dispatch | 固定版本、input_seq、execution、Outbox | 不重分序号，队列重投可收敛 |
+| 5 | Consumer / Lease / OpenForRun | 原envelope、DB高水位与顺序 | 后序持久停放；旧Fence拒绝 |
+| 6 | committedHistory | 同tenant/app/session终态、原输入及原结果 | 序列缺口、错用户或密钥/摘要不符即失败 |
+| 7 | BufferedTurn / 官方SDK | 原事件域 + 当前root request/Fence投影 | 原SDK事实保留，不以terminal回滚 |
+| 8 | 完成/终态/ReplyRoute | 原候选/结果、session_commit、原账号目标 | 恢复原业务或发送，不改会话绕过 |
+
+在源码中追踪事件扩展 `trpc.execution.v1`：只保存可信 request_id 与 fence；PreserveCallID 为运行期确认恢复约束、不序列化。它帮助当前尝试配对工具调用，不取代过去轮次的终态投影。完整SDK/平台字段分别见[数据库](../DATABASE.md#平台顺序与-sdk-状态)与[内部对象](../INTERFACES.md#对象与逐字段合同)。
+
+
 ## 带着一条输入检查六个接口交接
 
 本节按运行顺序解释需要在模块交界保留下来的信息；下文表格再定位具体函数。交接成功后，下一个模块应能独立继续，不依赖前一个进程内的请求对象。

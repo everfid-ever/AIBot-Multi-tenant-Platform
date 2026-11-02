@@ -1,5 +1,7 @@
 # 故障恢复后继续对话 — 测试与验收
 
+完整实现阅读基线：`0f53489`；[实现历程](../IMPLEMENTATION-HISTORY.md)、[有效表字段/约束](../DATABASE.md)、[接口/配置](../INTERFACES.md)、[逐阶段读写与恢复](../END-TO-END-DATA-FLOW.md)。本篇继续保留相应层级的精确代码/DDL或判据，不将它们当作实际部署执行结果。
+
 ## 终态与后续上下文的一致性回归
 
 `worker/terminal_history_test.go` 经真实 SDK 验证：模型原始草稿经 renderer 形成不同最终答案，在候选已保存/公开结果未保存时退出，接管提交不增加模型调用；再向 SDK 写入迟到高 Fence 错误答案，下一轮模型仍收到原输入和准确的最终 assistant 消息，不含草稿。另覆盖 denied/cancelled/failed/confirmation_denied/timeout 的安全历史、原输入不重新暴露和跨用户读取拒绝。`storage/session/history_test.go` 校验投影不修改原事件，`session/{postgres,inmemory}/terminal_history_test.go` 校验作用域、顺序与最近窗口。

@@ -1,10 +1,21 @@
 # 故障恢复后继续对话
 
+
+## 从头到尾的完整阅读路径
+
+1. [概念与边界](OVERVIEW.md)，明确保护对象和实际模式。
+2. [完整业务故事与机制讲解](FULL-GUIDE.md#连贯讲解用户为什么能在换节点后继续原会话)：依次讲可信身份、可靠接收、执行资格、权威历史、终态与原路由回复；再读[全部提交/迁移历程](../IMPLEMENTATION-HISTORY.md)。
+3. [30阶段数据链路](../END-TO-END-DATA-FLOW.md)，逐步核对事务与故障责任。
+4. [本能力设计](design.md) + [65张表的字段字典](../DATABASE.md) + [HTTP/内部对象/配置](../INTERFACES.md)。
+5. [运行走读](implementation-walkthrough.md)→[代码证据](CODE-APPENDIX.md)→[精确参考实现](REFERENCE-IMPLEMENTATION.md)。
+6. [判据](testing-and-acceptance.md)与[发布运维](release-and-operations.md)，区分代码机制和真实环境证据。
+
+
 保护两个独立 Bot 的租户归属、原会话上下文、请求身份与回复目的地。故障发生在一轮已完成之后，再发送新消息验证会话连续性；处理中的旧消息另按在途接管判定。
 
 ## 当前实现状态与阅读顺序
 
-正文按当前工作区的迁移000001–000004、运行时、入口与Compose配置编写。CURRENT-IMPLEMENTATION仅提供摘要；各篇正文直接给出当前机制，不通过“历史与基线冲突时覆盖”维持两套说法。
+正文按当前工作区的迁移000001–000008、运行时、入口与Compose配置编写。CURRENT-IMPLEMENTATION仅提供摘要；各篇正文直接给出当前机制，不通过“历史与基线冲突时覆盖”维持两套说法。
 
 | 文件 | 层级 | 负责回答 | 读者与可跳过范围 |
 |---|---|---|---|

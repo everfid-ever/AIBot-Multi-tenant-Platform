@@ -1,5 +1,15 @@
 # 故障恢复后继续对话 — 设计文档
 
+
+## 本能力的全量数据与接口索引
+
+当前代码基线为 `0f53489`。本篇解释本能力的结构、字段用途和竞态；共同字段以[有效迁移合并后的数据库字典](../DATABASE.md)为准，含类型、默认、空值、主/外键、CHECK及索引。不能只读000001中的最初CREATE而漏掉后续ALTER。
+
+直接关联表：[`channel_binding`](../DATABASE.md#channel_binding)、[`channel_binding_locator`](../DATABASE.md#channel_binding_locator)、[`channel_public_route`](../DATABASE.md#channel_public_route)、[`channel_ingress_candidate`](../DATABASE.md#channel_ingress_candidate)、[`inbox`](../DATABASE.md#inbox)、[`inbound_payload`](../DATABASE.md#inbound_payload)、[`preprocess_job`](../DATABASE.md#preprocess_job)、[`prepared_payload`](../DATABASE.md#prepared_payload)、[`execution_record`](../DATABASE.md#execution_record)、[`session_head`](../DATABASE.md#session_head)、[`session_commit`](../DATABASE.md#session_commit)、[`session_events`](../DATABASE.md#session_events)、[`session_states`](../DATABASE.md#session_states)、[`result_payload`](../DATABASE.md#result_payload)、[`outbox`](../DATABASE.md#outbox)、[`delivery_ledger`](../DATABASE.md#delivery_ledger)、[`delivery_receipt`](../DATABASE.md#delivery_receipt)。
+
+[内部对象和精确接口](../INTERFACES.md)覆盖加密JSON中的目标/计划/检查点/候选、跨Redis的envelope/reply、所有真实HTTP参数与启动配置；[完整数据链路](../END-TO-END-DATA-FLOW.md)逐步说明哪些在同事务、何时可ACK及故障后读哪份事实。表外的Redis键、SDK app_name与秘密AAD同样属于实现契约。
+
+
 ## 重试历史的读取视图
 
 当前 Worker 使用两层视图：ConfigureHistory 整理**当前请求**的旧尝试和批准调用；ConfigureCommittedHistory 则按 **session_commit 权威终态**重建过去轮次。后者优先于最高 Fence 推断，因为高 Fence 草稿也可能未提交、被取消或在答案审核时被拒绝。直接使用 BufferedTurn 而不配置终态快照的调用方仍只有基础过滤，不具备 Worker 的终态投影保证。

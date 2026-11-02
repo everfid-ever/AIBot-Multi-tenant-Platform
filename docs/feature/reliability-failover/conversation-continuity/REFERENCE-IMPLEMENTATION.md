@@ -1,5 +1,7 @@
 # 故障恢复后继续对话 — 参考实现
 
+完整实现阅读基线：`0f53489`；[实现历程](../IMPLEMENTATION-HISTORY.md)、[有效表字段/约束](../DATABASE.md)、[接口/配置](../INTERFACES.md)、[逐阶段读写与恢复](../END-TO-END-DATA-FLOW.md)。本篇继续保留相应层级的精确代码/DDL或判据，不将它们当作实际部署执行结果。
+
 ## 终态历史投影的当前契约
 
 新增 TerminalHistoryReader.ListTerminalHistory(ctx, SessionKey, beforeInputSeq, limit)，不改原 AtomicSessionStore 接口，也不新增数据库表。Worker 要求该接口可用，生产 PG 与本地 inmemory 已实现。limit 限 1–100；按 tenant/app/session 过滤、只读 input_seq < beforeInputSeq 的六类 terminal，先倒序取最新窗口再正序输出。返回 RequestID、CommitID、InputSeq、Fence、Outcome、ResultRef、CommittedAt，分别来自既有 session_commit 同名字段。

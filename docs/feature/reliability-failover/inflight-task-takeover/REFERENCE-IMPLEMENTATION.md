@@ -1,5 +1,7 @@
 # 在途任务接管与幂等投递 — 参考实现
 
+完整实现阅读基线：`0f53489`；[实现历程](../IMPLEMENTATION-HISTORY.md)、[有效表字段/约束](../DATABASE.md)、[接口/配置](../INTERFACES.md)、[逐阶段读写与恢复](../END-TO-END-DATA-FLOW.md)。本篇继续保留相应层级的精确代码/DDL或判据，不将它们当作实际部署执行结果。
+
 ## 业务笔记与完整记录分页接入
 
 真实业务核验接口为 `tool.BusinessResultVerifier.VerifyBusinessResult(ctx, canonicalArgs, receipt)`，只允许只读查询。Guard 在保存成功结果前、以及工具成功结果被显式复用时调用；失败记录不确定状态，不把它当作安全重放许可。租户工具门面转发该接口并核对上下文租户。

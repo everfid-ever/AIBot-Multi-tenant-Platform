@@ -1,5 +1,7 @@
 # 单主机多容器实例可用性 — 参考实现
 
+完整实现阅读基线：`0f53489`；[实现历程](../IMPLEMENTATION-HISTORY.md)、[有效表字段/约束](../DATABASE.md)、[接口/配置](../INTERFACES.md)、[逐阶段读写与恢复](../END-TO-END-DATA-FLOW.md)。本篇继续保留相应层级的精确代码/DDL或判据，不将它们当作实际部署执行结果。
+
 ## 复刻范围和共享契约
 
 本能力不新建节点本地业务表。会话、执行、Outbox、Ledger、工具与处置表的逐字段设计分别见 [会话设计](../conversation-continuity/design.md)、[在途设计](../inflight-task-takeover/design.md)；原文DDL与Redis协议见相应参考实现。两个容器必须共享这些事实，不能部署两套独立环境来模拟接管。
