@@ -1,5 +1,19 @@
 # 在途任务接管与幂等投递 — 测试与验收
 
+## 业务读回与分页的代码验证
+
+| 用例 | 判据 |
+|---|---|
+| localnote/task_test.go | 明确命令产生原参数摘要，模型更改内容时 BeforeTool 拒绝；普通聊天不产生写入要求；空、未知或重复 JSON 字段拒绝。 |
+| localnote/recovery_test.go | 业务效果已提交、工具结果失败后接管，创建调用/效果保持 1，恢复查询和独立读回分别计数；原检查点修复，最终答案必须包含真实 note_id。 |
+| business_verification_test.go / localnote/verification_test.go | 假成功但读回未确认时无 succeeded 结果；成功结果显式复用再核验而不重写；业务行不存在或正文不同拒绝。 |
+| final_evidence_test.go | 回执缺字段、空值、对象或布尔不能作为业务引用；精确数字保留，另一长标识不能冒充原编号。 |
+| tool/requirements_test.go | 同工具多条 evidence_path 全部核验，已提供输出 Schema 的缺失路径和非标量类型在发布前拒绝。 |
+| task_records_test.go | 五类主键游标往返，分页边界不重复；状态变化不改变位置；跨 scope/kind、超界数字和不受支持 kind 拒绝。 |
+| runtime_task_operations_test.go | 分页认证、长度限制及只读元数据响应，后续游标与 no-store；每个查询仍关联原 tenant/request。 |
+
+这些是代码契约回归，不代表已连接其他企业业务系统或完成真实渠道故障验收。分页的单页 SQL 观察和跨页并发边界需分别解释，不能把返回少于全量记录误判为数据丢失。
+
 ## 发布校验、摘要及详情接口的代码用例
 
 | 用例 | 判定 |

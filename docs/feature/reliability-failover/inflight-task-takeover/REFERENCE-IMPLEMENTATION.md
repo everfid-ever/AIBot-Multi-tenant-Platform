@@ -1,5 +1,24 @@
 # 在途任务接管与幂等投递 — 参考实现
 
+## 业务笔记与完整记录分页接入
+
+真实业务核验接口为 `tool.BusinessResultVerifier.VerifyBusinessResult(ctx, canonicalArgs, receipt)`，只允许只读查询。Guard 在保存成功结果前、以及工具成功结果被显式复用时调用；失败记录不确定状态，不把它当作安全重放许可。租户工具门面转发该接口并核对上下文租户。
+
+`TaskFinalEvidenceChecks() []*ResultCheck` 返回工具代码自有的最终引用条件，最多 8 项，必须是合法 non_empty 路径；工具回执必须有对应非空字符串或 JSON 数字。BeforeTool 将其保存到新操作的 Step.trusted_outputs，候选保存及 SealFinal 重查最终渲染内容；仅 Seal(ref) 不能绕过新引用合同。无此声明的工具继续沿用原合同。
+
+本地持久化笔记已实现独立读回和真实 note_id 最终引用。组合根通过 TaskRequirements 解析 `/note {"title":"...","content":"..."}`，冻结原参数 SHA-256；自然语言聊天不由关键词自动转换为该命令。创建仍走原用户确认和稳定业务键，不增加新的写入授权。
+
+分页示例：
+
+```text
+GET /ops/task/records?tenant_id=<tenant>&request_id=<request>&kind=tools&limit=50
+GET /ops/task/records?tenant_id=<same>&request_id=<same>&kind=tools&limit=50&cursor=<next_cursor>
+```
+
+响应含 tenant_id/request_id/kind/records/observed_at，存在后续时附 next_cursor；空 next_cursor 表示本观察页没有后续。排序按工具调用 ID、尝试号、提交复合主键、Outbox ID 或投递键/分段号；游标必须保持原 scope 与 kind。它不提供跨页快照一致性，当前请求并发插入的历史完整性不能由一次遍历推断。
+
+本轮无新 DDL。新增参数摘要与工具引用条件都位于原加密计划；分页读取既有业务表及索引，不修改队列、租约或终态。
+
 ## 发布与恢复诊断契约
 
 工具交付要求除 task_requirements 本身外，还必须有精确、强制的 ToolRefs。例如 Go Revision 中：

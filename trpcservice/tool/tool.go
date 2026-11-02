@@ -209,6 +209,19 @@ type tenantBoundCallable struct {
 
 func (t tenantBoundCallable) Declaration() *agenttool.Declaration { return t.inner.Declaration() }
 
+func (t tenantBoundCallable) VerifyBusinessResult(ctx context.Context, args, result []byte) error {
+	if e, ok := runtime.ExecutionContextFrom(ctx); !ok || e.TenantID != t.tenantID {
+		return runtime.ErrTenantScope
+	}
+	return verifyBusinessResult(ctx, t.inner, args, result)
+}
+func (t tenantBoundCallable) TaskFinalEvidenceChecks() []*taskflow.ResultCheck {
+	if d, ok := t.inner.(taskflow.FinalEvidenceDescriptor); ok {
+		return d.TaskFinalEvidenceChecks()
+	}
+	return nil
+}
+
 func (t tenantBoundCallable) TaskEvidenceCheck() *taskflow.ResultCheck {
 	if descriptor, ok := t.inner.(taskflow.EvidenceDescriptor); ok {
 		return descriptor.TaskEvidenceCheck()

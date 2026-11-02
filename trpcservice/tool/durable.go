@@ -71,7 +71,11 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		if descriptor, ok := g.Inner.(taskflow.EvidenceDescriptor); ok {
 			check = descriptor.TaskEvidenceCheck()
 		}
-		if err := task.BeforeTool(ctx, in, canonical, check); err != nil {
+		checks := []*taskflow.ResultCheck{check}
+		if d, ok := g.Inner.(taskflow.FinalEvidenceDescriptor); ok {
+			checks = append(checks, d.TaskFinalEvidenceChecks()...)
+		}
+		if err := task.BeforeTool(ctx, in, canonical, checks...); err != nil {
 			return nil, err
 		}
 	}
@@ -87,6 +91,9 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 			return nil, runtime.ErrVersionMismatch
 		}
 		if err = verifyToolReceipt(g.Inner, content); err != nil {
+			return nil, err
+		}
+		if err = verifyBusinessResult(ctx, g.Inner, canonical, content); err != nil {
 			return nil, err
 		}
 		if confirmed {
@@ -253,6 +260,9 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		finishErr := finishState(toolexecution.Failed, "tool_receipt_rejected")
 		return nil, errors.Join(err, finishErr)
 	}
+	if err = verifyBusinessResult(callCtx, g.Inner, canonical, content); err != nil {
+		return nil, errors.Join(err, finishState(toolexecution.EffectUnknown, "business_verification_unconfirmed"))
+	}
 	// Stop renewal before the atomic success transition: a renewal observing
 	// our own 'succeeded' row must not cancel the confirmation-result mirror.
 	stopRenew()
@@ -280,7 +290,12 @@ func verifyToolReceipt(inner interface{}, content []byte) error {
 		return taskflow.ErrEvidenceRejected
 	}
 	if d, ok := inner.(taskflow.EvidenceDescriptor); ok {
-		return d.TaskEvidenceCheck().Verify(content)
+		if err := d.TaskEvidenceCheck().Verify(content); err != nil {
+			return err
+		}
+	}
+	if d, ok := inner.(taskflow.FinalEvidenceDescriptor); ok {
+		return taskflow.VerifyFinalEvidenceReceipt(d.TaskFinalEvidenceChecks(), content)
 	}
 	return nil
 }

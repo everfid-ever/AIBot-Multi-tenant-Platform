@@ -1,5 +1,63 @@
 # 在途任务接管与幂等投递 — 设计文档
 
+## 具体业务闭环：原始笔记参数、独立读回与真实编号
+
+本轮选择现有持久化笔记作为具体业务场景，没有宣称已接入任意外部工单、付款或 ERP 服务。业务数据位于共享数据库的 local_note，与工具执行账本和 SDK 历史分开；注册及读回均保持原租户作用域。
+
+### 业务入口与完成合同
+
+同一应用组合根的两个租户支持明确命令：
+
+```text
+/note {"title":"发布记录","content":"待确认后保存的正文"}
+```
+
+原聊天输入保持权威。localnote.TaskRequirements 只识别明确的 `/note` 命令，不根据普通中文关键词推测必须写入。格式、未知/重复字段或长度不合法时，在首次绑定阶段失败，不开始业务写入。有效命令产生 create_requested_note 条件，指定精确笔记工具版本、原规范参数摘要以及最终必须引用 note_id；原有危险操作确认仍然必需，命令不能绕过确认。
+
+| 新字段 / 契约 | 数据层与算法 |
+|---|---|
+| Requirement.`args_digest` | 可选 64 位小写 SHA-256，只有指定工具的要求可设置；写入原 Acceptance 加密快照，进入候选 PlanDigest。对应原 JSON 参数规范化，字符串值不能由模型改写。 |
+| BeforeTool 参数约束 | 相同工具/版本存在参数限定时，调用必须匹配至少一项冻结摘要；即使模型暂不关联 requirement_ids，也不能通过新增无关联步骤写入另一份内容。已关联要求还须逐项匹配。 |
+| BusinessResultVerifier | 工具成功响应后、Complete 前执行只读业务核验；成功结果直接复用时也执行核验。失败保持 effect_unknown/business_verification_unconfirmed，不发布新的 succeeded 结果，不允许因此换键。 |
+| localnote.VerifyBusinessResult | 重新核对原上下文和规范参数，计算原业务键及完整预期 Result；独立 Lookup 实际业务行，认证 tenant/request/args_digest 与密文，逐项比较 status/note_id/title/content。不能仅回显创建入参或检查 status。 |
+| Step.`trusted_outputs` | 来自审核工具 TaskFinalEvidenceChecks，笔记要求 note_id；在首次绑定操作、尚未产生效果前冻结进原加密 Plan 与 checkpoint，不接受 define 提交的值。 |
+| 结果及最终答案闸门 | 先拒绝回执中缺失、空值或非字符串/数字的业务引用，再保存成功工具结果；最终渲染答案必须引用实际标量值。笔记编号使用 ASCII 标识边界，note_abc_extra 不能冒充 note_abc。 |
+
+工具最终引用条件只在实际使用相应工具时生效，不会要求普通聊天创建笔记。它不替代原任务的独立要求覆盖检查；明确 `/note` 命令的冻结业务合同还会阻止只完成分析步骤却没有执行创建。
+
+### 故障窗口与证据
+
+| 故障点 | 恢复及边界 |
+|---|---|
+| 笔记行已经提交、工具成功结果尚未提交 | 沿原业务键查询实际行，核对原参数和独立读回后补工具结果与检查点；不重复创建业务效果。 |
+| 查询发现行不存在或结果不一致 | 不把成功响应当成真实效果证据；保留不确定状态，由原恢复策略及预算决定后续动作，不盲换业务键。 |
+| 工具结果已成功保存 | 计划可复用通过认证的原业务证据；显式复用工具调用时还会读回。最终引用闸门使用原可信回执。 |
+| 答案省略/伪造笔记编号 | 拒绝当前答案，不结算、不冻结为成功；保留原笔记与已完成步骤，在原预算内修复文本。 |
+
+业务核验是记录成功结果前的读回，不是永久监视业务对象；检查点恢复或冻结答案恢复不会为所有已成功工具重新执行外部查询。笔记没有受支持的修改/删除操作；其他可变外部业务需要自己定义有效期、读回工具或新版本核验规则。通用代码执行继续 manual，MCP 仍须逐供应商声明可靠键和查询协议，不因新增接口自动升级恢复等级。
+
+已经绑定的旧操作保留原 trusted_outputs（可为空），不在恢复时悄悄追加新义务；已有非空合同不允许降低或替换。新绑定操作保存新引用条件。旧 Worker 不理解这些字段，升级仍须排空旧执行者。
+
+### 发布阶段的 Schema 核验
+
+当工具提供 OutputSchema 时，发布校验遍历配置 evidence_path 及工具可信最终引用路径，要求路径存在，目标为 string/integer/number；同一工具的多条要求逐项校验，不因复用目录解析结果而跳过第二条路径。未提供 Schema 的工具仍保留执行期检查，不能凭发布成功推断远端一定返回所需字段。声明结构正确也不证明外部业务效果正确，仍须实际业务契约及读回。
+
+## 长任务记录的游标分页
+
+`GET /ops/task/records` 与 incident 接口使用相同管理认证，参数为 tenant_id、request_id、kind、可选 limit/cursor。kind 白名单为 tools、attempts、commits、outbox、deliveries；默认 50 条，上限 100。记录继续只返回元数据，没有正文、规范参数、笔记、原始错误或 external_handle。
+
+| kind | 稳定排序与游标位置 |
+|---|---|
+| tools | tool_call_id。 |
+| attempts | attempt_no，以 bigint 检查范围，初始从 0 后读取。 |
+| commits | agent_app_id、session_id、commit_id 复合主键。 |
+| outbox | outbox_id，同时限定原 tenant/aggregate_id。 |
+| deliveries | delivery_key、segment_no，继续通过原租户、原请求的 reply Outbox 关联。 |
+
+每页读取 limit+1 判断后续是否存在；只返回 limit 条，next_cursor 绑定最后一条实际返回记录，下一页严格大于该键。游标是带 version、tenant、request、kind、after 的 Base64URL JSON，拒绝跨租户、跨请求、跨种类、畸形或超界数字。游标不是授权令牌，也不是签名证据；修改位置最多改变当前已授权范围内的读取位置，所有 SQL 仍强制租户与原请求过滤，表名/字段来自代码白名单。
+
+排序不使用可变化的 state/updated_at，所以记录从 running 变为 succeeded 不会因优先级变化重复翻页。每页是自己的数据库观察点，不是跨 HTTP 请求的原子历史导出；并发新插入且排序位置落在已翻过范围的记录可能不在当前遍历中，应刷新或重新遍历。incident 的优先级摘要和完整分页使用不同排序目的，不能拼接成一个一致性快照。未找到原 Inbox/Execution 返回 404，输入/游标错误 400，依赖错误 503。
+
 ## 发布前校验、恢复摘要与任务详情
 
 本轮沿用 000008 及既有表，不新增 DDL。完成条件解析由 `taskflow.ParseRequirements` 统一供发布和 Worker 使用，避免两个阶段接受不同的配置格式。
@@ -11,7 +69,7 @@
 3. 工具要求还须通过 Repository.Requirements 注入的部署校验器。缺少校验器时工具要求发布失败；纯文本要求不依赖工具目录。实际组合根已把该字段装配为 tool.Resolver.ValidateTaskRequirements。
 4. 部署校验按 tenant/id/version/content_digest 解析当前活动工具，检查实际声明和非空、合法的 TaskEvidenceCheck；不会调用业务 Call。Build 可能读取声明、访问只读元数据或解析凭据，仍受调用 context 控制。工具以后不可用时，运行期原有检查依然有效，发布成功不代表供应商永久在线。
 
-这些是 Go Repository 支持的发布入口约束；绕过 Repository 直接调用数据库发布函数不会执行进程内工具目录校验。工具结果没有统一输出 Schema，因此发布时不宣称能证明任意 evidence_path 必然存在；真实回执字段及值仍在执行期核对。指定工具的条件使用审核过的业务契约，不能仅凭字段名推断效果正确。
+这些是 Go Repository 支持的发布入口约束；绕过 Repository 直接调用数据库发布函数不会执行进程内工具目录校验。工具提供 OutputSchema 时，发布检查路径及标量类型；没有提供 Schema 时保留执行期核验，不能宣称任意路径必然存在。真实回执字段、值及业务效果仍在运行期核对。指定工具的条件使用审核过的业务契约，不能仅凭字段名推断效果正确。
 
 ### 结构化恢复摘要
 

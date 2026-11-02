@@ -1,5 +1,11 @@
 # 在途任务接管与幂等投递 — 实现走读
 
+## 具体业务的新增执行顺序
+
+明确 `/note` 输入 → 首次 TaskRequirements 冻结精确工具、规范参数摘要和 note_id 要求 → 模型定义覆盖步骤 → 原确认流程 → BeforeTool 检查参数及冻结 trusted_outputs → 原业务键创建或查询恢复 → receipt 基础断言与标量字段核验 → VerifyBusinessResult 独立查询业务表并逐项比对 → Complete 保存工具成功 → RecordTool → ValidateFinal 核对真实编号 → 原候选、结算、冻结和终态链路。
+
+工具已成功的显式复用先认证旧回执，再进行只读业务核验，不调用写操作；普通检查点或冻结答案恢复仍沿原已认证证据，不隐式对所有外部对象做实时巡检。新分页入口仅认证、解析 scope/cursor、执行白名单查询并生成后续游标，不调用工具或修改计划。
+
 ## 本轮发布与观察顺序
 
 发布前先 ValidateDraft/工具引用，PostgreSQL 再核对预期草稿版本，调用部署工具目录校验，最后才执行原数据库发布 CAS。执行期绑定条件改用同一 ParseRequirements；接管沿原合同恢复。

@@ -638,6 +638,27 @@ func completionPlanDigest(p taskflow.Plan) string {
 来源：`trpcservice/tool/durable.go`；operation ID、恢复策略、工具 lease 和成功结果复用适用于 allow+ask；grant 不二次消费。
 
 ```go
+package tool
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strconv"
+	"time"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
+	toolexecution "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
+)
+
 func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed bool, results toolexecution.DurableResults) (any, error) {
 	execution, _ := runtime.ExecutionContextFrom(ctx)
 	if !confirmed && len(args) == 0 {
@@ -690,7 +711,11 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		if descriptor, ok := g.Inner.(taskflow.EvidenceDescriptor); ok {
 			check = descriptor.TaskEvidenceCheck()
 		}
-		if err := task.BeforeTool(ctx, in, canonical, check); err != nil {
+		checks := []*taskflow.ResultCheck{check}
+		if d, ok := g.Inner.(taskflow.FinalEvidenceDescriptor); ok {
+			checks = append(checks, d.TaskFinalEvidenceChecks()...)
+		}
+		if err := task.BeforeTool(ctx, in, canonical, checks...); err != nil {
 			return nil, err
 		}
 	}
@@ -706,6 +731,9 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 			return nil, runtime.ErrVersionMismatch
 		}
 		if err = verifyToolReceipt(g.Inner, content); err != nil {
+			return nil, err
+		}
+		if err = verifyBusinessResult(ctx, g.Inner, canonical, content); err != nil {
 			return nil, err
 		}
 		if confirmed {
@@ -872,6 +900,9 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		finishErr := finishState(toolexecution.Failed, "tool_receipt_rejected")
 		return nil, errors.Join(err, finishErr)
 	}
+	if err = verifyBusinessResult(callCtx, g.Inner, canonical, content); err != nil {
+		return nil, errors.Join(err, finishState(toolexecution.EffectUnknown, "business_verification_unconfirmed"))
+	}
 	// Stop renewal before the atomic success transition: a renewal observing
 	// our own 'succeeded' row must not cancel the confirmation-result mirror.
 	stopRenew()
@@ -899,7 +930,12 @@ func verifyToolReceipt(inner interface{}, content []byte) error {
 		return taskflow.ErrEvidenceRejected
 	}
 	if d, ok := inner.(taskflow.EvidenceDescriptor); ok {
-		return d.TaskEvidenceCheck().Verify(content)
+		if err := d.TaskEvidenceCheck().Verify(content); err != nil {
+			return err
+		}
+	}
+	if d, ok := inner.(taskflow.FinalEvidenceDescriptor); ok {
+		return taskflow.VerifyFinalEvidenceReceipt(d.TaskFinalEvidenceChecks(), content)
 	}
 	return nil
 }
@@ -1330,6 +1366,7 @@ package taskflow
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1341,6 +1378,7 @@ import (
 // Requirement is supplied by trusted application code, never checkpoint arguments.
 // Literal and receipt checks are deterministic constraints, not semantic graders.
 type Requirement struct {
+	ArgsDigest     string   `json:"args_digest,omitempty"`
 	ID             string   `json:"id"`
 	Description    string   `json:"description"`
 	ToolID         string   `json:"tool_id,omitempty"`
@@ -1364,6 +1402,12 @@ func (a Acceptance) Validate() error {
 	for _, r := range a.Requirements {
 		if !validID(r.ID) || seen[r.ID] || strings.TrimSpace(r.Description) == "" || len(r.Description) > 1024 || len(r.ToolID) > 256 || (r.ToolID == "") != (r.ToolVersion == 0) || r.ToolVersion < 0 || len(r.OutputContains) > 16 || len(r.EvidencePath) > 8 || (len(r.EvidencePath) > 0 && r.ToolID == "") {
 			return runtime.ErrInvalidEnvelope
+		}
+		if r.ArgsDigest != "" {
+			b, e := hex.DecodeString(r.ArgsDigest)
+			if e != nil || len(b) != 32 || r.ArgsDigest != strings.ToLower(r.ArgsDigest) || r.ToolID == "" {
+				return runtime.ErrInvalidEnvelope
+			}
 		}
 		seen[r.ID] = true
 		for _, v := range r.OutputContains {
@@ -1447,6 +1491,13 @@ func validateCoverage(p Plan) error {
 	}
 	covered := map[string]bool{}
 	for _, st := range p.Steps {
+		if p.Acceptance != nil && st.ToolCallID != "" {
+			for _, r := range p.Acceptance.Requirements {
+				if containsID(st.RequirementIDs, r.ID) && r.ArgsDigest != "" && r.ArgsDigest != st.ArgsDigest {
+					return runtime.ErrVersionMismatch
+				}
+			}
+		}
 		if err := validateStepRequirements(p.Acceptance, st); err != nil {
 			return err
 		}
@@ -1481,6 +1532,9 @@ func (s *Session) ValidateFinal(ctx context.Context, content []byte) (p Plan, er
 	}()
 	p, err = s.ValidateCompletion(ctx)
 	if err != nil {
+		return p, err
+	}
+	if err = s.validateToolFinalEvidence(ctx, p, content); err != nil {
 		return p, err
 	}
 	if p.Acceptance == nil {
@@ -1814,6 +1868,7 @@ package tool
 import (
 	"context"
 	"fmt"
+	agenttool "trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agentapp"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/profile"
@@ -1830,29 +1885,72 @@ func (r Resolver) ValidateTaskRequirements(ctx context.Context, revision agentap
 	if err != nil {
 		return err
 	}
-	checked := map[string]bool{}
+	checked := map[string]agenttool.Tool{}
 	for _, required := range requirements {
-		if required.ToolID == "" || checked[required.ToolID] {
+		if required.ToolID == "" {
 			continue
 		}
-		var ref profile.VersionedRef
-		for _, pinned := range revision.ToolRefs {
-			if pinned.ID == required.ToolID && pinned.Version == required.ToolVersion {
-				ref = profile.VersionedRef{ID: pinned.ID, Version: pinned.Version, ContentDigest: pinned.ContentDigest}
+		value := checked[required.ToolID]
+		if value == nil {
+			var ref profile.VersionedRef
+			for _, pinned := range revision.ToolRefs {
+				if pinned.ID == required.ToolID && pinned.Version == required.ToolVersion {
+					ref = profile.VersionedRef{ID: pinned.ID, Version: pinned.Version, ContentDigest: pinned.ContentDigest}
+				}
+			}
+			values, e := r.ResolveTools(ctx, revision.TenantID, []profile.VersionedRef{ref})
+			if e != nil {
+				return fmt.Errorf("%w: task requirement %s tool unavailable: %w", agentapp.ErrInvalid, required.ID, e)
+			}
+			if len(values) != 1 {
+				return fmt.Errorf("%w: task requirement tool unavailable", agentapp.ErrInvalid)
+			}
+			value = values[0]
+			descriptor, ok := value.(taskflow.EvidenceDescriptor)
+			if !ok {
+				return fmt.Errorf("%w: missing trusted completion check", agentapp.ErrInvalid)
+			}
+			check := descriptor.TaskEvidenceCheck()
+			if check == nil || !check.Valid() {
+				return fmt.Errorf("%w: invalid trusted completion check", agentapp.ErrInvalid)
+			}
+			if final, ok := value.(taskflow.FinalEvidenceDescriptor); ok {
+				checks := final.TaskFinalEvidenceChecks()
+				if len(checks) > 8 {
+					return agentapp.ErrInvalid
+				}
+				for _, c := range checks {
+					if c == nil || !c.Valid() || !c.NonEmpty || validateEvidencePath(value.Declaration().OutputSchema, c.Path) != nil {
+						return fmt.Errorf("%w: invalid final evidence declaration", agentapp.ErrInvalid)
+					}
+				}
+			}
+			checked[required.ToolID] = value
+		}
+		if len(required.EvidencePath) > 0 {
+			if err = validateEvidencePath(value.Declaration().OutputSchema, required.EvidencePath); err != nil {
+				return err
 			}
 		}
-		values, e := r.ResolveTools(ctx, revision.TenantID, []profile.VersionedRef{ref})
-		if e != nil {
-			return fmt.Errorf("%w: task requirement %s tool unavailable: %w", agentapp.ErrInvalid, required.ID, e)
+
+	}
+	return nil
+}
+
+// An explicit OutputSchema must support the configured scalar path. Schemaless
+// tools retain runtime checking; publication cannot infer a provider schema.
+func validateEvidencePath(schema *agenttool.Schema, path []string) error {
+	if schema == nil {
+		return nil
+	}
+	for _, part := range path {
+		if schema.Type != "object" || schema.Properties[part] == nil {
+			return fmt.Errorf("%w: unknown evidence output path", agentapp.ErrInvalid)
 		}
-		if len(values) != 1 {
-			return fmt.Errorf("%w: task requirement tool unavailable", agentapp.ErrInvalid)
-		}
-		descriptor, ok := values[0].(taskflow.EvidenceDescriptor)
-		if !ok || descriptor.TaskEvidenceCheck() == nil || !descriptor.TaskEvidenceCheck().Valid() {
-			return fmt.Errorf("%w: task requirement %s has no trusted completion check", agentapp.ErrInvalid, required.ID)
-		}
-		checked[required.ToolID] = true
+		schema = schema.Properties[part]
+	}
+	if schema.Type != "string" && schema.Type != "integer" && schema.Type != "number" {
+		return fmt.Errorf("%w: evidence output must be a scalar reference", agentapp.ErrInvalid)
 	}
 	return nil
 }
@@ -1919,4 +2017,457 @@ const taskIncidentSQL = `WITH target AS (SELECT tenant_id,request_id FROM inbox 
 'delivery_count',(SELECT count(*) FROM delivery_ledger d WHERE d.tenant_id=$1 AND EXISTS(SELECT 1 FROM outbox o WHERE o.tenant_id=$1 AND o.aggregate_id=$2 AND o.kind='reply' AND o.idempotency_key=d.delivery_key)),
 'deliveries',(SELECT coalesce(jsonb_agg(q ORDER BY (q.state<>'sent') DESC,q.updated_at DESC,q.delivery_key,q.segment_no),'[]') FROM (SELECT d.delivery_key,d.segment_no,d.state,d.version,d.attempt,d.reconcile_attempt,d.last_error_class,d.provider_message_id,d.claim_owner,d.claim_until,d.updated_at,EXISTS(SELECT 1 FROM delivery_receipt r WHERE r.tenant_id=$1 AND r.delivery_key=d.delivery_key AND r.segment_no=d.segment_no) has_receipt FROM delivery_ledger d WHERE d.tenant_id=$1 AND EXISTS(SELECT 1 FROM outbox o WHERE o.tenant_id=$1 AND o.aggregate_id=$2 AND o.kind='reply' AND o.idempotency_key=d.delivery_key) ORDER BY (d.state<>'sent') DESC,d.updated_at DESC,d.delivery_key,d.segment_no LIMIT 100) q)
 ) FROM target LEFT JOIN execution_record e ON e.tenant_id=target.tenant_id AND e.request_id=target.request_id`
+```
+
+## 业务与分页代码：trpcservice/tool/business_verification.go
+
+来源：`trpcservice/tool/business_verification.go`，完整文件。业务状态变化、参数/证据约束与分页边界见 design。
+
+```go
+package tool
+
+import "context"
+
+// BusinessResultVerifier performs a read-only business postcondition check.
+// A successful API response alone must not substitute for persisted effects.
+// Verification failure preserves uncertainty; it never grants write permission.
+type BusinessResultVerifier interface {
+	VerifyBusinessResult(context.Context, []byte, []byte) error
+}
+
+func verifyBusinessResult(ctx context.Context, inner any, args, result []byte) error {
+	if verifier, ok := inner.(BusinessResultVerifier); ok {
+		return verifier.VerifyBusinessResult(ctx, args, result)
+	}
+	return nil
+}
+```
+
+## 业务与分页代码：trpcservice/tool/localnote/task.go
+
+来源：`trpcservice/tool/localnote/task.go`，完整文件。业务状态变化、参数/证据约束与分页边界见 design。
+
+```go
+package localnote
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
+)
+
+// TaskRequirements recognizes an explicit business command, never heuristics
+// over ordinary conversation. Confirmation is still mandatory before writing.
+func TaskRequirements(text string) ([]taskflow.Requirement, error) {
+	text = strings.TrimSpace(text)
+	if text != "/note" && !strings.HasPrefix(text, "/note ") && !strings.HasPrefix(text, "/note\n") {
+		return nil, nil
+	}
+	args := []byte(strings.TrimSpace(strings.TrimPrefix(text, "/note")))
+	if len(args) == 0 || len(args) > maximumArguments {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	canonical, digest, err := governance.CanonicalArguments(args)
+	if err != nil {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	var in input
+	d := json.NewDecoder(bytes.NewReader(canonical))
+	d.DisallowUnknownFields()
+	if d.Decode(&in) != nil || strings.TrimSpace(in.Title) == "" || strings.TrimSpace(in.Content) == "" || len(strings.TrimSpace(in.Title)) > maximumTitle || len(strings.TrimSpace(in.Content)) > maximumContent || strings.ContainsRune(in.Title, 0) || strings.ContainsRune(in.Content, 0) {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	return []taskflow.Requirement{{ID: "create_requested_note", Description: "Create exactly the note described by the original /note JSON after user confirmation, read back the persisted record, and return its real note_id. Preserve the original JSON string values when calling the tool.", ToolID: ID, ToolVersion: Version, ArgsDigest: digest, EvidencePath: []string{"note_id"}}}, nil
+}
+```
+
+## 业务与分页代码：trpcservice/tool/localnote/verification.go
+
+来源：`trpcservice/tool/localnote/verification.go`，完整文件。业务状态变化、参数/证据约束与分页边界见 design。
+
+```go
+package localnote
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"strings"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
+)
+
+func (Tool) TaskFinalEvidenceChecks() []*taskflow.ResultCheck {
+	return []*taskflow.ResultCheck{{Path: []string{"note_id"}, NonEmpty: true}}
+}
+
+// VerifyBusinessResult independently reads the actual business row. Compare
+// both original approved arguments and the candidate receipt, not a text status.
+func (t Tool) VerifyBusinessResult(ctx context.Context, args, content []byte) error {
+	e, ok := runtime.ExecutionContextFrom(ctx)
+	if !ok {
+		return runtime.ErrTenantScope
+	}
+	canonical, digest, err := governance.CanonicalArguments(args)
+	if err != nil || digest != e.ArgsDigest {
+		return runtime.ErrVersionMismatch
+	}
+	var in input
+	decoder := json.NewDecoder(bytes.NewReader(canonical))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&in) != nil {
+		return runtime.ErrInvalidEnvelope
+	}
+	key, err := t.RecoveryKey(ctx)
+	if err != nil {
+		return err
+	}
+	expected := Result{Status: "created", NoteID: "note_" + key[:24], Title: strings.TrimSpace(in.Title), Content: strings.TrimSpace(in.Content)}
+	canonicalReceipt, _, receiptErr := governance.CanonicalArguments(content)
+	if receiptErr != nil {
+		return runtime.ErrVersionMismatch
+	}
+	var receipt Result
+	receiptDecoder := json.NewDecoder(bytes.NewReader(canonicalReceipt))
+	receiptDecoder.DisallowUnknownFields()
+	if receiptDecoder.Decode(&receipt) != nil || receipt != expected {
+		return runtime.ErrVersionMismatch
+	}
+	reader, ok := t.Writer.(Reader)
+	if !ok {
+		return runtime.ErrCapabilityUnsupported
+	}
+	observed, err := reader.Lookup(ctx, LookupKey{TenantID: e.TenantID, RequestID: e.RequestID, BusinessKey: key, ArgsDigest: digest})
+	if err != nil {
+		return err
+	}
+	if observed != expected {
+		return runtime.ErrVersionMismatch
+	}
+	return nil
+}
+```
+
+## 业务与分页代码：trpcservice/taskflow/final_evidence.go
+
+来源：`trpcservice/taskflow/final_evidence.go`，完整文件。业务状态变化、参数/证据约束与分页边界见 design。
+
+```go
+package taskflow
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// FinalEvidenceDescriptor pins adapter-owned output references to the operation
+// before it executes. It does not create obligations for unrelated chat tasks.
+type FinalEvidenceDescriptor interface{ TaskFinalEvidenceChecks() []*ResultCheck }
+
+// VerifyFinalEvidenceReceipt rejects missing/non-scalar business references
+// before a durable tool result can be published as succeeded.
+func VerifyFinalEvidenceReceipt(checks []*ResultCheck, content []byte) error {
+	if !validFinalEvidence(checks) {
+		return ErrEvidenceRejected
+	}
+	for _, check := range checks {
+		if _, err := scalarAt(content, check.Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validFinalEvidence(checks []*ResultCheck) bool {
+	if len(checks) > 8 {
+		return false
+	}
+	for _, c := range checks {
+		if c == nil || !c.valid() || !c.NonEmpty {
+			return false
+		}
+	}
+	return true
+}
+
+func scalarAt(content []byte, path []string) (string, error) {
+	v, err := decodeJSON(content)
+	if err != nil {
+		return "", ErrEvidenceRejected
+	}
+	for _, key := range path {
+		object, ok := v.(map[string]any)
+		if !ok {
+			return "", ErrEvidenceRejected
+		}
+		v = object[key]
+	}
+	var text string
+	switch x := v.(type) {
+	case string:
+		text = x
+	case json.Number:
+		text = x.String()
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", ErrEvidenceRejected
+	}
+	return text, nil
+}
+
+func (s *Session) validateToolFinalEvidence(ctx context.Context, p Plan, content []byte) error {
+	for _, st := range p.Steps {
+		if len(st.TrustedOutputs) == 0 {
+			continue
+		}
+		if st.Kind != "tool" || !validFinalEvidence(st.TrustedOutputs) {
+			return ErrEvidenceRejected
+		}
+		_, b, err := s.verifyTool(ctx, st, p.Contract.RequireToolChecks)
+		if err != nil {
+			return err
+		}
+		for _, check := range st.TrustedOutputs {
+			text, err := scalarAt(b, check.Path)
+			if err != nil {
+				return err
+			}
+			if !containsBusinessReference(string(content), text) {
+				return fmt.Errorf("final answer missing business reference for step %s: %w", st.ID, ErrIncomplete)
+			}
+		}
+	}
+	return nil
+}
+
+// Business identifiers require ASCII token boundaries, so note_abc_extra does
+// not count as a reference to note_abc. Chinese prose can abut an ASCII ID.
+func containsBusinessReference(answer, reference string) bool {
+	id := func(c byte) bool {
+		return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
+	}
+	for offset := 0; offset <= len(answer)-len(reference); {
+		i := strings.Index(answer[offset:], reference)
+		if i < 0 {
+			return false
+		}
+		i += offset
+		end := i + len(reference)
+		left := i == 0 || !id(reference[0]) || !id(answer[i-1])
+		right := end == len(answer) || !id(reference[len(reference)-1]) || !id(answer[end])
+		if left && right {
+			return true
+		}
+		offset = i + 1
+	}
+	return false
+}
+```
+
+## 业务与分页代码：trpcservice/storage/messaging/postgres/task_records.go
+
+来源：`trpcservice/storage/messaging/postgres/task_records.go`，完整文件。业务状态变化、参数/证据约束与分页边界见 design。
+
+```go
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"strconv"
+	"time"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+)
+
+type TaskRecordsQuery struct {
+	TenantID, RequestID, Kind, Cursor string
+	Limit                             int
+}
+type TaskRecordsPage struct {
+	TenantID   string            `json:"tenant_id"`
+	RequestID  string            `json:"request_id"`
+	Kind       string            `json:"kind"`
+	Records    []json.RawMessage `json:"records"`
+	NextCursor string            `json:"next_cursor,omitempty"`
+	ObservedAt time.Time         `json:"observed_at"`
+}
+type taskRecordsCursor struct {
+	Version int      `json:"version"`
+	Tenant  string   `json:"tenant"`
+	Request string   `json:"request"`
+	Kind    string   `json:"kind"`
+	After   []string `json:"after"`
+}
+
+func parseRecordsCursor(in TaskRecordsQuery) ([]string, error) {
+	if ValidateTaskIncidentKey(in.TenantID, in.RequestID) != nil || in.Limit < 0 || in.Limit > 100 {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	n := 1
+	switch in.Kind {
+	case "tools", "attempts", "outbox":
+	case "commits":
+		n = 3
+	case "deliveries":
+		n = 2
+	default:
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	after := make([]string, n)
+	if in.Cursor == "" {
+		if in.Kind == "attempts" {
+			after[0] = "0"
+		}
+		if in.Kind == "deliveries" {
+			after[1] = "-1"
+		}
+		return after, nil
+	}
+	if len(in.Cursor) > 8192 {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	b, err := base64.RawURLEncoding.DecodeString(in.Cursor)
+	if err != nil {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	var c taskRecordsCursor
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if d.Decode(&c) != nil || d.Decode(new(any)) != io.EOF || c.Version != 1 || c.Tenant != in.TenantID || c.Request != in.RequestID || c.Kind != in.Kind || len(c.After) != n {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	for _, v := range c.After {
+		if v == "" || len(v) > 1024 {
+			return nil, runtime.ErrInvalidEnvelope
+		}
+	}
+	if in.Kind == "attempts" {
+		v, e := strconv.ParseInt(c.After[0], 10, 64)
+		if e != nil || v < 1 {
+			return nil, runtime.ErrInvalidEnvelope
+		}
+	}
+	if in.Kind == "deliveries" {
+		v, e := strconv.ParseInt(c.After[1], 10, 32)
+		if e != nil || v < 0 {
+			return nil, runtime.ErrInvalidEnvelope
+		}
+	}
+	return c.After, nil
+}
+
+// Pages use immutable primary-key order rather than mutable priority/state.
+// Each page is a live statement snapshot, not a historical export transaction.
+func (s *Store) GetTaskRecordsPage(ctx context.Context, in TaskRecordsQuery) (TaskRecordsPage, error) {
+	page := TaskRecordsPage{TenantID: in.TenantID, RequestID: in.RequestID, Kind: in.Kind, Records: []json.RawMessage{}}
+	after, err := parseRecordsCursor(in)
+	if err != nil {
+		return page, err
+	}
+	limit := in.Limit
+	if limit == 0 {
+		limit = 50
+	}
+	query, args := taskRecordsSQL(in, after, limit+1)
+	var exists bool
+	var b []byte
+	if err = s.db.QueryRowContext(ctx, query, args...).Scan(&exists, &b, &page.ObservedAt); err != nil {
+		return page, err
+	}
+	if !exists {
+		return page, runtime.ErrNotFound
+	}
+	if err = json.Unmarshal(b, &page.Records); err != nil {
+		return page, err
+	}
+	if len(page.Records) > limit {
+		page.Records = page.Records[:limit]
+		position, e := recordPosition(in.Kind, page.Records[limit-1])
+		if e != nil {
+			return page, e
+		}
+		c, _ := json.Marshal(taskRecordsCursor{Version: 1, Tenant: in.TenantID, Request: in.RequestID, Kind: in.Kind, After: position})
+		page.NextCursor = base64.RawURLEncoding.EncodeToString(c)
+	}
+	return page, nil
+}
+
+func recordPosition(kind string, b []byte) ([]string, error) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(b, &fields) != nil {
+		return nil, runtime.ErrInvariantViolation
+	}
+	keys := []string{"tool_call_id"}
+	switch kind {
+	case "attempts":
+		keys = []string{"attempt_no"}
+	case "outbox":
+		keys = []string{"outbox_id"}
+	case "commits":
+		keys = []string{"agent_app_id", "session_id", "commit_id"}
+	case "deliveries":
+		keys = []string{"delivery_key", "segment_no"}
+	}
+	var out []string
+	for _, k := range keys {
+		if k == "attempt_no" || k == "segment_no" {
+			var n int64
+			if json.Unmarshal(fields[k], &n) != nil {
+				return nil, runtime.ErrInvariantViolation
+			}
+			out = append(out, strconv.FormatInt(n, 10))
+		} else {
+			var v string
+			if json.Unmarshal(fields[k], &v) != nil || v == "" {
+				return nil, runtime.ErrInvariantViolation
+			}
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+func taskRecordsSQL(in TaskRecordsQuery, after []string, limit int) (string, []any) {
+	args := []any{in.TenantID, in.RequestID}
+	var records, order string
+	switch in.Kind {
+	case "tools":
+		records = `SELECT tool_call_id,tool_id,tool_version,state,recovery_policy,attempt,fence,lease_owner,lease_until,result_ref,(last_error IS NOT NULL AND last_error<>'') has_error,created_at,updated_at FROM tool_execution WHERE tenant_id=$1 AND request_id=$2 AND tool_call_id>$3 ORDER BY tool_call_id LIMIT $4`
+		order = "q.tool_call_id"
+		args = append(args, after[0], limit)
+	case "attempts":
+		n, _ := strconv.ParseInt(after[0], 10, 64)
+		records = `SELECT attempt_no,worker_id,fence,state,started_at,finished_at FROM execution_attempt WHERE tenant_id=$1 AND request_id=$2 AND attempt_no>$3 ORDER BY attempt_no LIMIT $4`
+		order = "q.attempt_no"
+		args = append(args, n, limit)
+	case "outbox":
+		records = `SELECT outbox_id,kind,idempotency_key,state,version,attempt,claim_owner,claim_until,next_attempt_at,created_at FROM outbox WHERE tenant_id=$1 AND aggregate_id=$2 AND outbox_id>$3 ORDER BY outbox_id LIMIT $4`
+		order = "q.outbox_id"
+		args = append(args, after[0], limit)
+	case "commits":
+		records = `SELECT agent_app_id,session_id,commit_id,stage,outcome,fence,created_at FROM session_commit WHERE tenant_id=$1 AND request_id=$2 AND (agent_app_id,session_id,commit_id)>($3,$4,$5) ORDER BY agent_app_id,session_id,commit_id LIMIT $6`
+		order = "q.agent_app_id,q.session_id,q.commit_id"
+		args = append(args, after[0], after[1], after[2], limit)
+	case "deliveries":
+		n, _ := strconv.ParseInt(after[1], 10, 32)
+		records = `SELECT d.delivery_key,d.segment_no,d.state,d.version,d.attempt,d.reconcile_attempt,d.last_error_class,d.provider_message_id,d.claim_owner,d.claim_until,d.updated_at,EXISTS(SELECT 1 FROM delivery_receipt r WHERE r.tenant_id=$1 AND r.delivery_key=d.delivery_key AND r.segment_no=d.segment_no) has_receipt FROM delivery_ledger d WHERE d.tenant_id=$1 AND (d.delivery_key,d.segment_no)>($3,$4) AND EXISTS(SELECT 1 FROM outbox o WHERE o.tenant_id=$1 AND o.aggregate_id=$2 AND o.kind='reply' AND o.idempotency_key=d.delivery_key) ORDER BY d.delivery_key,d.segment_no LIMIT $5`
+		order = "q.delivery_key,q.segment_no"
+		args = append(args, after[0], n, limit)
+	}
+	// Every inserted SQL fragment comes from the fixed switch, not query input.
+	query := `WITH target AS (SELECT tenant_id,request_id FROM inbox WHERE tenant_id=$1 AND request_id=$2 UNION SELECT tenant_id,request_id FROM execution_record WHERE tenant_id=$1 AND request_id=$2) SELECT EXISTS(SELECT 1 FROM target),(SELECT coalesce(jsonb_agg(q ORDER BY ` + order + `),'[]') FROM (` + records + `) q),now()`
+	return query, args
+}
 ```

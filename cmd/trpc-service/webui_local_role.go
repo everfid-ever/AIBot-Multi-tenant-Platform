@@ -84,6 +84,7 @@ import (
 	serviceqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/storage/knowledge/qdrant"
 	messagingpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging/postgres"
 	sessionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/storage/session/postgres"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 	taskflowpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/taskflow/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	tenantpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tenant/postgres"
@@ -94,6 +95,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	agentmemory "trpc.group/trpc-go/trpc-agent-go/memory"
 	agentmemorypg "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
+	sdkmodel "trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 const (
@@ -378,6 +380,9 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	}
 	executor := worker.RunnerExecutor{Tasks: tasks, Profiles: profiles, Bundles: bundles,
 		TaskPlans: taskPlans, ToolExecutions: durableTools,
+		TaskRequirements: func(_ context.Context, _ runtime.ExecutionEnvelope, message sdkmodel.Message) ([]taskflow.Requirement, error) {
+			return localnote.TaskRequirements(message.Content)
+		},
 		Sessions: sessionpostgres.NewWithTelemetry(db, telemetryProvider), SDKSessions: sdkSessions, Payloads: payloads, Artifacts: artifacts,
 		Inputs: worker.JSONTextInputDecoder{}, EventDrainTimeout: 30 * time.Second,
 		Progress:   progressPublisher,

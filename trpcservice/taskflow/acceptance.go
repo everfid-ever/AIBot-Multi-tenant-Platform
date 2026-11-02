@@ -2,6 +2,7 @@ package taskflow
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 // Requirement is supplied by trusted application code, never checkpoint arguments.
 // Literal and receipt checks are deterministic constraints, not semantic graders.
 type Requirement struct {
+	ArgsDigest     string   `json:"args_digest,omitempty"`
 	ID             string   `json:"id"`
 	Description    string   `json:"description"`
 	ToolID         string   `json:"tool_id,omitempty"`
@@ -36,6 +38,12 @@ func (a Acceptance) Validate() error {
 	for _, r := range a.Requirements {
 		if !validID(r.ID) || seen[r.ID] || strings.TrimSpace(r.Description) == "" || len(r.Description) > 1024 || len(r.ToolID) > 256 || (r.ToolID == "") != (r.ToolVersion == 0) || r.ToolVersion < 0 || len(r.OutputContains) > 16 || len(r.EvidencePath) > 8 || (len(r.EvidencePath) > 0 && r.ToolID == "") {
 			return runtime.ErrInvalidEnvelope
+		}
+		if r.ArgsDigest != "" {
+			b, e := hex.DecodeString(r.ArgsDigest)
+			if e != nil || len(b) != 32 || r.ArgsDigest != strings.ToLower(r.ArgsDigest) || r.ToolID == "" {
+				return runtime.ErrInvalidEnvelope
+			}
 		}
 		seen[r.ID] = true
 		for _, v := range r.OutputContains {
@@ -119,6 +127,13 @@ func validateCoverage(p Plan) error {
 	}
 	covered := map[string]bool{}
 	for _, st := range p.Steps {
+		if p.Acceptance != nil && st.ToolCallID != "" {
+			for _, r := range p.Acceptance.Requirements {
+				if containsID(st.RequirementIDs, r.ID) && r.ArgsDigest != "" && r.ArgsDigest != st.ArgsDigest {
+					return runtime.ErrVersionMismatch
+				}
+			}
+		}
 		if err := validateStepRequirements(p.Acceptance, st); err != nil {
 			return err
 		}
@@ -153,6 +168,9 @@ func (s *Session) ValidateFinal(ctx context.Context, content []byte) (p Plan, er
 	}()
 	p, err = s.ValidateCompletion(ctx)
 	if err != nil {
+		return p, err
+	}
+	if err = s.validateToolFinalEvidence(ctx, p, content); err != nil {
 		return p, err
 	}
 	if p.Acceptance == nil {

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	messagingpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging/postgres"
@@ -63,6 +64,25 @@ func TestTaskIncidentMissingOriginalRequestReturnsNotFound(t *testing.T) {
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, r)
 	if w.Code != 404 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTaskRecordPageIsAuthenticatedMetadataWithContinuation(t *testing.T) {
+	db, m, _ := sqlmock.New()
+	defer db.Close()
+	mux := http.NewServeMux()
+	registerRuntimeOperations(mux, "admin-token", db, messagingpostgres.New(db), nil)
+	m.ExpectQuery("WITH target AS").WithArgs("a", "r", "", 2).WillReturnRows(sqlmock.NewRows([]string{"exists", "records", "observed"}).AddRow(true, `[{"tool_call_id":"op1","state":"running"},{"tool_call_id":"op2","state":"succeeded"}]`, time.Now()))
+	r := httptest.NewRequest("GET", "/ops/task/records?tenant_id=a&request_id=r&kind=tools&limit=1", nil)
+	r.Header.Set("X-TRPC-Local-Token", "admin-token")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	var page messagingpostgres.TaskRecordsPage
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &page) != nil || len(page.Records) != 1 || page.NextCursor == "" || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	if err := m.ExpectationsWereMet(); err != nil {

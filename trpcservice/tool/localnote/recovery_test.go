@@ -2,6 +2,7 @@ package localnote
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -215,7 +216,7 @@ func TestConfirmedNoteTakeoverQueriesBusinessFactAndRepairsOriginalCheckpoint(t 
 	if _, err = call.Call(ctx, args); err != nil {
 		t.Fatal(err)
 	}
-	if writer.creates != 1 || writer.lookups != 1 || len(writer.rows) != 1 {
+	if writer.creates != 1 || writer.lookups != 3 || len(writer.rows) != 1 {
 		t.Fatalf("writes/lookups/effects=%d/%d/%d", writer.creates, writer.lookups, len(writer.rows))
 	}
 	if store.record.Attempt != 2 || grants.consumed != 1 || grants.consumeAttempts != 2 || grants.attempt.State != governance.ToolAttemptSucceeded {
@@ -224,6 +225,16 @@ func TestConfirmedNoteTakeoverQueriesBusinessFactAndRepairsOriginalCheckpoint(t 
 	p, err = task.ValidateCompletion(ctx)
 	if err != nil || p.Steps[0].ToolCallID != "confirmed-call" || p.Steps[0].ResultRef != store.record.ResultRef {
 		t.Fatal("original checkpoint not repaired", p, err)
+	}
+	if _, err = task.ValidateFinal(ctx, []byte("note created")); !errors.Is(err, taskflow.ErrIncomplete) {
+		t.Fatalf("missing real note reference accepted: %v", err)
+	}
+	var created Result
+	if json.Unmarshal(store.output, &created) != nil {
+		t.Fatal("invalid saved note receipt")
+	}
+	if _, err = task.ValidateFinal(ctx, []byte("Created note "+created.NoteID)); err != nil {
+		t.Fatal(err)
 	}
 	mirrored, err := mirrors.GetToolResult(ctx, "tenant", "grant")
 	if err != nil || mirrored.ResultRef != store.record.ResultRef {

@@ -16,6 +16,30 @@ func (checkedCatalogTool) TaskEvidenceCheck() *taskflow.ResultCheck {
 	return &taskflow.ResultCheck{Path: []string{"status"}, EqualsJSON: `"created"`}
 }
 
+type schemaCatalogTool struct{ checkedCatalogTool }
+
+func (schemaCatalogTool) Declaration() *agenttool.Declaration {
+	return &agenttool.Declaration{Name: "create", OutputSchema: &agenttool.Schema{Type: "object", Properties: map[string]*agenttool.Schema{"record_id": {Type: "string"}, "ok": {Type: "boolean"}}}}
+}
+
+func TestPublicationChecksEachEvidencePathEvenForSameCachedTool(t *testing.T) {
+	catalog, err := NewCatalog(Registration{TenantID: "t", ID: "create", Version: 2, Status: StatusActive, Build: func(context.Context, BuildRequest) (agenttool.CallableTool, error) { return schemaCatalogTool{}, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := agentapp.Revision{TenantID: "t", ToolRefs: []agentapp.VersionedRef{{ID: "create", Version: 2, Required: true}}, RuntimePolicy: map[string]any{"task_requirements": []taskflow.Requirement{{ID: "valid", Description: "record", ToolID: "create", ToolVersion: 2, EvidencePath: []string{"record_id"}}}}}
+	resolver := Resolver{Catalog: catalog}
+	if err = resolver.ValidateTaskRequirements(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"missing", "ok"} {
+		r.RuntimePolicy["task_requirements"] = []taskflow.Requirement{{ID: "valid", Description: "record", ToolID: "create", ToolVersion: 2, EvidencePath: []string{"record_id"}}, {ID: "invalid", Description: "invalid", ToolID: "create", ToolVersion: 2, EvidencePath: []string{path}}}
+		if err = resolver.ValidateTaskRequirements(context.Background(), r); !errors.Is(err, agentapp.ErrInvalid) {
+			t.Fatalf("invalid or non-scalar output path accepted: %v", err)
+		}
+	}
+}
+
 func TestPublishToolValidationChecksTenantAndTrustedContractWithoutCallingBusinessTool(t *testing.T) {
 	for _, trusted := range []bool{false, true} {
 		calls := 0

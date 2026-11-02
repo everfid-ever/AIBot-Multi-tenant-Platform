@@ -31,6 +31,38 @@ func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, sto
 		w.Header().Set("Cache-Control", "no-store")
 		return true
 	}
+	mux.HandleFunc("GET /ops/task/records", func(w http.ResponseWriter, r *http.Request) {
+		if !authorize(w, r) {
+			return
+		}
+		q := r.URL.Query()
+		limit := 0
+		if raw := q.Get("limit"); raw != "" {
+			var err error
+			limit, err = strconv.Atoi(raw)
+			if err != nil || limit < 1 || limit > 100 {
+				http.Error(w, "limit must be 1..100", 400)
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		page, err := store.GetTaskRecordsPage(ctx, messagingpostgres.TaskRecordsQuery{TenantID: q.Get("tenant_id"), RequestID: q.Get("request_id"), Kind: q.Get("kind"), Limit: limit, Cursor: q.Get("cursor")})
+		if errors.Is(err, runtime.ErrInvalidEnvelope) {
+			http.Error(w, "invalid scope, kind or cursor", 400)
+			return
+		}
+		if errors.Is(err, runtime.ErrNotFound) {
+			http.Error(w, "task not found", 404)
+			return
+		}
+		if err != nil {
+			http.Error(w, "records unavailable", 503)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(page)
+	})
 	mux.HandleFunc("GET /ops/task/incident", func(w http.ResponseWriter, r *http.Request) {
 		if !authorize(w, r) {
 			return
