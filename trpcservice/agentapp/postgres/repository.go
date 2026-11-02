@@ -12,7 +12,10 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agentapp"
 )
 
-type Repository struct{ db *sql.DB }
+type Repository struct {
+	db           *sql.DB
+	Requirements agentapp.RequirementValidator
+}
 
 func New(db *sql.DB) *Repository { return &Repository{db: db} }
 
@@ -307,6 +310,15 @@ func (r *Repository) Publish(ctx context.Context, in agentapp.PublishInput) (age
 	}
 	revision, err := r.GetRevision(ctx, in.TenantID, in.AgentAppID, in.Revision)
 	if err != nil {
+		return agentapp.PublishResult{}, err
+	}
+	if revision.DraftVersion != in.ExpectedDraftVersion {
+		return agentapp.PublishResult{}, agentapp.ErrVersionConflict
+	}
+	if revision.State != agentapp.RevisionDraft {
+		return agentapp.PublishResult{}, agentapp.ErrImmutable
+	}
+	if err := agentapp.ValidatePublication(ctx, revision, r.Requirements); err != nil {
 		return agentapp.PublishResult{}, err
 	}
 	digest, err := revision.ComputeContentDigest()

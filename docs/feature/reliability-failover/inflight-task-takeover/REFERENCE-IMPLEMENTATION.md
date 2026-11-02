@@ -1,5 +1,25 @@
 # 在途任务接管与幂等投递 — 参考实现
 
+## 发布与恢复诊断契约
+
+工具交付要求除 task_requirements 本身外，还必须有精确、强制的 ToolRefs。例如 Go Revision 中：
+
+```go
+ToolRefs: []agentapp.VersionedRef{{ID: "create_record", Version: 1, Required: true}}
+```
+
+两种 Repository 在 Publish 中调用 ValidatePublication；工具要求必须装配 `Repository.Requirements = resolver.ValidateTaskRequirements`。实际单主机运行组合根已装配。校验器读取工具声明和可信完成断言，不能执行业务 Call；缺少校验器时拒绝工具要求发布。发布与运行共用 ParseRequirements，字段/大小限制一致，Worker 接管仍复用已经冻结的条件。直接数据库函数没有进程工具目录，不能代替该发布入口。
+
+| 接口或函数 | 当前契约 |
+|---|---|
+| taskflow.ParseRequirements(policy) | 无配置返回 nil；配置存在时拒绝 null、错误类型、未知字段及超过 64 KiB 的序列化配置，继续执行 Acceptance 的逐项约束。 |
+| Revision.ValidateTaskRequirements | 精确工具版本必须存在于本 revision 的 Required ToolRefs；纯输出条件不要求工具。 |
+| tool.Resolver.ValidateTaskRequirements | 使用租户、工具版本与声明摘要解析真实活动工具，要求合法可信 TaskEvidenceCheck；不保证没有 Schema 的任意回执路径在未来响应中存在。 |
+| taskflow.SummarizeRecovery(plan, now) | 只投影原计划，不写库、不申请租约、不调用模型或业务工具；运行前需 Recover，运维读取不作新的业务认证。 |
+| GET /ops/task/incident | tenant_id + request_id 必填；独立 OperationsToken；200/400/401/404/503；no-store。snapshot 是一次 SQL 快照，checkpoint_recovery 独立读取并标注版本匹配状态。 |
+
+返回 snapshot 的数组上限为 100，计数与数组长度分开；细节及元数据清单见 design。任意缺失或变化不得当成安全重放授权，仍经原租约和工具恢复协议判定。
+
 ## 完成条件配置与函数契约
 
 以下配置属于已发布 Agent App 的 `runtime_policy`，随原发布摘要及执行 profile 固定。不是用户聊天消息或 task_checkpoint 的入参，也不是进程全局可变开关。示例工具名和字段须替换成实际审核过的注册工具及结果结构。

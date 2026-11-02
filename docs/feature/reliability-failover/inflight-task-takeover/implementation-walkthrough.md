@@ -1,5 +1,13 @@
 # 在途任务接管与幂等投递 — 实现走读
 
+## 本轮发布与观察顺序
+
+发布前先 ValidateDraft/工具引用，PostgreSQL 再核对预期草稿版本，调用部署工具目录校验，最后才执行原数据库发布 CAS。执行期绑定条件改用同一 ParseRequirements；接管沿原合同恢复。
+
+ResumeInstruction 在 Recover 后构建 recovery_summary，再与原 Plan 和工具结果一起送入恢复上下文。摘要没有写入接口，杀进程后重新从持久事实计算，不需要恢复另一套缓存状态。
+
+GET 详情时先认证 token/tenant/request；单条 SQL 读取 Inbox 到投递的原请求链路，随后可选解密计划并只返回摘要元数据，最后比较计划版本与 Fence。此处失败只影响查询，不改变任务、租约、工具或 Outbox。
+
 ## 本轮新增的目标与最终输出闸门
 
 运行顺序更新为：加载持久输入并解码 → Open → 首次 BindAcceptance / 接管复用原合同 → Recover → 恢复已有候选或结果 → BeginAttempt → 模型规划/工具执行 → 渲染 → ValidateFinal → 保存完成候选 → 原治理结算 → PutResult → SealFinal → terminal/Outbox。任何新答案缺项都停在候选和结算之前；completion_issue 与原进度一起持久保存。此时被杀后，新 owner 读取原合同、原已完成步骤和修复原因，不重新定义目标。

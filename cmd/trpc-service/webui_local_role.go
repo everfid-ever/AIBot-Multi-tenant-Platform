@@ -307,6 +307,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		return errors.New("tool catalog initialization failed")
 	}
 	tools := servicetool.Resolver{Catalog: toolCatalog, Secrets: bootstrap.SecretStore}
+	appRepo.Requirements = tools.ValidateTaskRequirements
 	artifacts := artifactpostgres.New(db)
 	artifactResolver := serviceartifact.Resolver{Profiles: bootstrap.ProviderRepo,
 		PostgresConnections: map[string]string{"default": configValue.PostgresDSN}, Stores: map[string]storageartifact.Store{"default": artifacts}}
@@ -475,7 +476,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		})
 	}
 	if configValue.OperationsToken != "" {
-		registerRuntimeOperations(mux, configValue.OperationsToken, db, inbox, leases)
+		registerRuntimeOperations(mux, configValue.OperationsToken, db, inbox, leases, taskPlans)
 	}
 	// Parent cancellation requests a drain; active work has a separate context
 	// so SIGTERM does not cancel it before the bounded drain completes.

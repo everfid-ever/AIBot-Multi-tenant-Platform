@@ -1,5 +1,54 @@
 # 在途任务接管与幂等投递 — 设计文档
 
+## 发布前校验、恢复摘要与任务详情
+
+本轮沿用 000008 及既有表，不新增 DDL。完成条件解析由 `taskflow.ParseRequirements` 统一供发布和 Worker 使用，避免两个阶段接受不同的配置格式。
+
+### 发布链路的职责与顺序
+
+1. Revision.ValidateDraft 在创建/修改草稿及发布时校验 task_requirements 的结构、上限、重复 ID 和字段关系。工具要求必须引用本 revision 的精确 ToolRefs，且 Required=true；不能把必需交付物绑定到未声明、错误版本或可缺省工具。
+2. PostgreSQL Publish 读取草稿后先核对 ExpectedDraftVersion 与 draft 状态，再执行 ValidatePublication。这样，校验过的草稿版本必须与后续 publish_agent_app_revision 的 CAS 相同，更新后的草稿不能沿用旧校验摘要。发布拒绝时不推进应用版本、发布状态或 Outbox。
+3. 工具要求还须通过 Repository.Requirements 注入的部署校验器。缺少校验器时工具要求发布失败；纯文本要求不依赖工具目录。实际组合根已把该字段装配为 tool.Resolver.ValidateTaskRequirements。
+4. 部署校验按 tenant/id/version/content_digest 解析当前活动工具，检查实际声明和非空、合法的 TaskEvidenceCheck；不会调用业务 Call。Build 可能读取声明、访问只读元数据或解析凭据，仍受调用 context 控制。工具以后不可用时，运行期原有检查依然有效，发布成功不代表供应商永久在线。
+
+这些是 Go Repository 支持的发布入口约束；绕过 Repository 直接调用数据库发布函数不会执行进程内工具目录校验。工具结果没有统一输出 Schema，因此发布时不宣称能证明任意 evidence_path 必然存在；真实回执字段及值仍在执行期核对。指定工具的条件使用审核过的业务契约，不能仅凭字段名推断效果正确。
+
+### 结构化恢复摘要
+
+ResumeInstruction 仍携带原 Plan 和有界工具结果，并新增 recovery_summary。摘要由已持久化事实计算，无独立写入状态、租约或另一个恢复计划。运行路径先 Recover 认证工具结果；摘要不能替代 Fencing、工具 Guard 或最终完成检查。
+
+| 摘要字段 | 设计及判定 |
+|---|---|
+| plan_version / fence / phase / input_digest | 标记投影对应的检查点及原输入；原始目标继续位于同一 Plan.acceptance.objective，完整输入保持权威。 |
+| completed | 已完成步骤的 ID、kind、工具身份、result_ref、evidence_digest，不重新执行已验证效果。 |
+| active / unknown_effects / failed | 分别列出运行中、效果未知与失败步骤；未知效果不能进入 ready。 |
+| ready | open 且未过期、依赖均成功、没有活动或失败步骤时，列出可开始的 pending 步骤 ID。它只说明静态就绪，不授予执行权。 |
+| blocked | pending 步骤及依赖未完成、活动步骤未结束、失败步骤、任务关闭或期限到达等原因。 |
+| unplanned_requirements | 尚未被任何已声明步骤覆盖的服务端要求。 |
+| unfinished_requirements | 未规划或其关联步骤尚未全部成功的要求。 |
+| needs_final_repair | 存在持久 completion_issue，仅返回布尔；运行 Plan 继续包含具体修复原因。 |
+| next_action | 停止失败/超期、恢复冻结结果、核对未知效果、继续活动步骤、补齐计划、执行就绪步骤、修复输出或最终校验等确定性提示。 |
+| attempts / no_progress / remaining_attempts / deadline | 展示已有预算。remaining_attempts 指未来新尝试机会；当前第 8 次合法尝试可以继续工作，不能因剩余新尝试为零就阻止它完成。 |
+
+诊断接口中的摘要来自已存检查点，不主动 Recover，不重新查询供应商，不更改任务；检查点可能落后于工具账本，须结合 snapshot.tools 观察。它不是一次新的完成认证。
+
+### 任务详情的数据关联和边界
+
+`GET /ops/task/incident?tenant_id=<tenant>&request_id=<original-request>` 使用独立管理 token，全部查询显式限定 tenant 和原 request。单条数据库语句产生 snapshot，以 Inbox 或 Execution 任一存在为入口，覆盖已持久接收但尚未创建 Execution 的窗口。
+
+| 返回部分 | 数据源及用途 |
+|---|---|
+| snapshot.inbox / preprocess | 原接收状态、会话坐标、预处理状态与租约，Execution 尚不存在时仍可查询。 |
+| snapshot.execution / attempts | 执行结果、配置关联、取消/阻塞状态，模型调用与请求尝试计数，以及 Worker/Fence/任务尝试。 |
+| snapshot.plan / checkpoint_count | 计划 phase/version/fence 与快照数量，不返回密文或笔记。 |
+| snapshot.tools | 原工具调用 ID、工具版本、恢复策略、状态、尝试、租约、结果引用和 has_error；不返回参数、external_handle 或原始错误。 |
+| snapshot.completion / commits | 完成候选的摘要与创建 Fence，以及会话提交阶段/结果；waiting 记录不冒充最终成功。 |
+| snapshot.outbox / deliveries | 仅通过同租户、原 aggregate_id 的 reply Outbox 关联 delivery_key，再按 segment 查询状态及 has_receipt，不能借请求参数读取其他回复。 |
+| checkpoint_recovery | 通过已配置任务 Store 解密后只投影上述恢复元数据；不返回 objective、条件正文、笔记、工具参数或解密结果。 |
+| checkpoint_status | matches_snapshot 只表示计划 version/fence 与数据库快照一致；changed_since_snapshot 表示两次读取之间变化；reader_not_configured / not_found 分别标明未装配读取器或无检查点。 |
+
+数据库 snapshot 内各部分同一语句读取；解密检查点为独立读取，不能把整个响应称为原子快照。不存在返回 404，依赖或解密失败返回 503；失效不能当成“任务不存在”。数组最多 100 条，工具优先非 succeeded、Outbox 优先未 published、投递优先非 sent，尝试取最近记录。attempt_count/tool_count/outbox_count/delivery_count 是全量数量；commits 仅展示最新 100 条，不得据截断数组断言全部历史。接口只读，不提供重新打开终态、强制重跑或删除未知副作用的操作。
+
 ## 原始目标、必需交付物与最终输出校验
 
 本轮在现有加密 Plan 中加入 Acceptance，不另建表。`task_plan.ciphertext` 保存当前完整合同，`task_checkpoint.ciphertext` 保存每次修改后的快照，沿用 tenant/request/input_digest/version/key_version 的 AAD、会话 Fence 和版本 CAS。部署迁移仍须执行到 000008。该能力不是用模型自报“完成”作为唯一依据：配置声明的必需交付物必须被步骤覆盖，实际渲染答案必须通过确定性检查。

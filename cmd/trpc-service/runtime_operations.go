@@ -17,11 +17,12 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 	messagingpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging/postgres"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 )
 
 // Operations routes use deployment-admin credentials, never Bot credentials.
 // Every query requires an explicit tenant and excludes message bodies/secrets.
-func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, store *messagingpostgres.Store, leases coordination.LeaseInspector) {
+func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, store *messagingpostgres.Store, leases coordination.LeaseInspector, plans ...taskflow.Store) {
 	authorize := func(w http.ResponseWriter, r *http.Request) bool {
 		if token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-TRPC-Local-Token")), []byte(token)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -30,6 +31,60 @@ func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, sto
 		w.Header().Set("Cache-Control", "no-store")
 		return true
 	}
+	mux.HandleFunc("GET /ops/task/incident", func(w http.ResponseWriter, r *http.Request) {
+		if !authorize(w, r) {
+			return
+		}
+		tenant, request := r.URL.Query().Get("tenant_id"), r.URL.Query().Get("request_id")
+		if messagingpostgres.ValidateTaskIncidentKey(tenant, request) != nil {
+			http.Error(w, "tenant_id and request_id required", 400)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		snapshot, err := store.GetTaskIncident(ctx, tenant, request)
+		if errors.Is(err, runtime.ErrNotFound) {
+			http.Error(w, "task not found", 404)
+			return
+		}
+		if err != nil {
+			http.Error(w, "task status unavailable", 503)
+			return
+		}
+		out := struct {
+			Snapshot         json.RawMessage           `json:"snapshot"`
+			Recovery         *taskflow.RecoverySummary `json:"checkpoint_recovery,omitempty"`
+			CheckpointStatus string                    `json:"checkpoint_status"`
+		}{Snapshot: snapshot, CheckpointStatus: "reader_not_configured"}
+		if len(plans) > 0 && plans[0] != nil {
+			p, readErr := plans[0].Get(ctx, taskflow.Key{TenantID: tenant, RequestID: request})
+			if errors.Is(readErr, runtime.ErrNotFound) {
+				out.CheckpointStatus = "not_found"
+			} else if readErr != nil {
+				http.Error(w, "checkpoint unavailable", 503)
+				return
+			} else {
+				summary := taskflow.SummarizeRecovery(p, time.Now())
+				out.Recovery = &summary
+				var metadata struct {
+					Plan *struct {
+						Version int64  `json:"version"`
+						Fence   uint64 `json:"fence"`
+					} `json:"plan"`
+				}
+				if json.Unmarshal(snapshot, &metadata) != nil {
+					http.Error(w, "invalid task snapshot", 503)
+					return
+				}
+				out.CheckpointStatus = "changed_since_snapshot"
+				if metadata.Plan != nil && metadata.Plan.Version == p.Version && metadata.Plan.Fence == p.Fence {
+					out.CheckpointStatus = "matches_snapshot"
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})
 	mux.HandleFunc("GET /ops/session/lease", func(w http.ResponseWriter, r *http.Request) {
 		if !authorize(w, r) {
 			return

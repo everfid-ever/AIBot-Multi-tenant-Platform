@@ -18,6 +18,8 @@ func TestRuntimeOperationsRequireAdminAndExplicitScope(t *testing.T) {
 		method, path, token, body string
 		status                    int
 	}{
+		{"GET", "/ops/task/incident?tenant_id=a&request_id=r", "", "", 401},
+		{"GET", "/ops/task/incident?tenant_id=a", "admin-token", "", 400},
 		{"GET", "/ops/reliability?tenant_id=a", "", "", 401},
 		{"GET", "/ops/reliability", "admin-token", "", 400},
 		{"GET", "/ops/session/lease?tenant_id=a", "admin-token", "", 400},

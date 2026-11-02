@@ -1,5 +1,13 @@
 # 在途任务接管与幂等投递 — 发布与运维
 
+## 发布工具条件与查询原任务
+
+本轮无新迁移，继续要求数据库至 000008。工具类条件发布前检查本 revision 的精确 Required ToolRefs，并为 Repository.Requirements 注入实际部署 Resolver；生产组合根已接入，自建组合根须显式装配，不能以空校验器绕过。
+
+诊断使用 `GET /ops/task/incident?tenant_id=<tenant>&request_id=<original-request>`，认证方式与原 `/ops/delivery/incident` 相同。先看 Inbox/预处理与 execution；再看计划/尝试、原工具状态与租约、候选/commits、Outbox 和逐段投递，最后比较 checkpoint_status。返回 changed_since_snapshot 时刷新观察，不把两个时间点拼为一次原子状态。非成功工具、未发布 Outbox 和非 sent 分段优先显示，超过 100 条时结合全量计数识别截断。
+
+checkpoint_recovery 只读，不主动核对外部效果；unknown_effects 不授权重跑，stop_failed 不表示可重新打开原终态。需要外部处置时沿原审计机制进行；本轮没有增加任务/工具强制重放或终态修改接口。
+
 ## 完成条件配置发布
 
 本轮无新迁移，数据库仍需执行至 000008。通过新的 Agent App 发布版本配置 runtime_policy.task_requirements，工具条件使用实际已注册的工具名及版本，先确认对应完成断言和回执结构。Worker 首次冻结后不因配置变化放松原任务；需要变更目标时，应新建业务请求，不能修改已存合同或重新打开终态。

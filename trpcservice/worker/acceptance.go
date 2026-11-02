@@ -1,9 +1,7 @@
 package worker
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"strings"
 	"unicode/utf8"
 
@@ -45,16 +43,9 @@ func (w RunnerExecutor) bindTaskAcceptance(ctx context.Context, task *taskflow.S
 		objective = objective[:end] + "\n[Objective excerpt; full original input is retained under input_digest.]"
 	}
 	a := taskflow.Acceptance{Version: 1, InputDigest: p.InputDigest, Objective: objective}
-	if configured, ok := policy["task_requirements"]; ok {
-		b, marshalErr := json.Marshal(configured)
-		if marshalErr != nil || len(b) > 64<<10 || string(b) == "null" {
-			return runtime.ErrInvalidEnvelope
-		}
-		d := json.NewDecoder(bytes.NewReader(b))
-		d.DisallowUnknownFields()
-		if err = d.Decode(&a.Requirements); err != nil {
-			return runtime.ErrInvalidEnvelope
-		}
+	a.Requirements, err = taskflow.ParseRequirements(policy)
+	if err != nil {
+		return err
 	}
 	if w.TaskRequirements != nil {
 		extra, resolveErr := w.TaskRequirements(ctx, e, message)

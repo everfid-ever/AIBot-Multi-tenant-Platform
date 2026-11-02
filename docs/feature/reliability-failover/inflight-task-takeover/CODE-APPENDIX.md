@@ -1558,9 +1558,7 @@ func containsID(ids []string, id string) bool {
 package worker
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"strings"
 	"unicode/utf8"
 
@@ -1602,16 +1600,9 @@ func (w RunnerExecutor) bindTaskAcceptance(ctx context.Context, task *taskflow.S
 		objective = objective[:end] + "\n[Objective excerpt; full original input is retained under input_digest.]"
 	}
 	a := taskflow.Acceptance{Version: 1, InputDigest: p.InputDigest, Objective: objective}
-	if configured, ok := policy["task_requirements"]; ok {
-		b, marshalErr := json.Marshal(configured)
-		if marshalErr != nil || len(b) > 64<<10 || string(b) == "null" {
-			return runtime.ErrInvalidEnvelope
-		}
-		d := json.NewDecoder(bytes.NewReader(b))
-		d.DisallowUnknownFields()
-		if err = d.Decode(&a.Requirements); err != nil {
-			return runtime.ErrInvalidEnvelope
-		}
+	a.Requirements, err = taskflow.ParseRequirements(policy)
+	if err != nil {
+		return err
 	}
 	if w.TaskRequirements != nil {
 		extra, resolveErr := w.TaskRequirements(ctx, e, message)
@@ -1623,4 +1614,309 @@ func (w RunnerExecutor) bindTaskAcceptance(ctx context.Context, task *taskflow.S
 	_, err = task.BindAcceptance(ctx, a)
 	return err
 }
+```
+
+## 发布与观察代码：trpcservice/taskflow/config.go
+
+来源：`trpcservice/taskflow/config.go`，完整文件。职责、读取时序和边界见 design；这些读取不替代原工具执行授权。
+
+```go
+package taskflow
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+)
+
+// ParseRequirements is shared by publication and execution. Policy is trusted
+// versioned application configuration, never model-supplied checkpoint data.
+func ParseRequirements(policy map[string]any) ([]Requirement, error) {
+	v, ok := policy["task_requirements"]
+	if !ok {
+		return nil, nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil || len(b) > 64<<10 || string(b) == "null" {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	var requirements []Requirement
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if err = d.Decode(&requirements); err != nil {
+		return nil, runtime.ErrInvalidEnvelope
+	}
+	a := Acceptance{Version: 1, InputDigest: strings.Repeat("0", 64), Objective: "configuration validation", Requirements: requirements}
+	if err = a.Validate(); err != nil {
+		return nil, err
+	}
+	return requirements, nil
+}
+```
+
+## 发布与观察代码：trpcservice/taskflow/recovery_summary.go
+
+来源：`trpcservice/taskflow/recovery_summary.go`，完整文件。职责、读取时序和边界见 design；这些读取不替代原工具执行授权。
+
+```go
+package taskflow
+
+import "time"
+
+type StepProgress struct {
+	ID             string `json:"id"`
+	Kind           string `json:"kind"`
+	State          string `json:"state"`
+	ToolID         string `json:"tool_id,omitempty"`
+	ToolVersion    int64  `json:"tool_version,omitempty"`
+	ResultRef      string `json:"result_ref,omitempty"`
+	EvidenceDigest string `json:"evidence_digest,omitempty"`
+}
+type BlockedStep struct {
+	ID           string   `json:"id"`
+	Reason       string   `json:"reason"`
+	Dependencies []string `json:"dependencies,omitempty"`
+}
+type RecoverySummary struct {
+	Failed                 []StepProgress `json:"failed"`
+	NeedsFinalRepair       bool           `json:"needs_final_repair"`
+	PlanVersion            int64          `json:"plan_version"`
+	Fence                  uint64         `json:"fence"`
+	Phase                  string         `json:"phase"`
+	InputDigest            string         `json:"input_digest"`
+	Completed              []StepProgress `json:"completed"`
+	Active                 []StepProgress `json:"active"`
+	Ready                  []string       `json:"ready"`
+	Blocked                []BlockedStep  `json:"blocked"`
+	UnplannedRequirements  []string       `json:"unplanned_requirements"`
+	UnfinishedRequirements []string       `json:"unfinished_requirements"`
+	UnknownEffects         []string       `json:"unknown_effects"`
+	NextAction             string         `json:"next_action"`
+	FailureReason          string         `json:"failure_reason,omitempty"`
+	Attempts               int            `json:"attempts"`
+	NoProgress             int            `json:"no_progress"`
+	RemainingAttempts      int            `json:"remaining_attempts"`
+	Deadline               time.Time      `json:"deadline,omitempty"`
+}
+
+// SummarizeRecovery is a read-only projection, not another task authority or
+// permission to execute. Runtime callers must Recover/verify evidence first.
+// Operations callers expose it as observed checkpoint metadata, never as a
+// fresh assertion that a provider effect has completed.
+func SummarizeRecovery(p Plan, now time.Time) RecoverySummary {
+	s := RecoverySummary{PlanVersion: p.Version, Fence: p.Fence, Phase: p.Phase, InputDigest: p.InputDigest, Completed: []StepProgress{}, Failed: []StepProgress{}, NeedsFinalRepair: p.CompletionIssue != "", Active: []StepProgress{}, Ready: []string{}, Blocked: []BlockedStep{}, UnplannedRequirements: []string{}, UnfinishedRequirements: []string{}, UnknownEffects: []string{}, FailureReason: p.FailureReason, Attempts: p.Attempts, NoProgress: p.NoProgress, RemainingAttempts: p.Contract.MaxAttempts - p.Attempts}
+	if s.RemainingAttempts < 0 {
+		s.RemainingAttempts = 0
+	}
+	if !p.StartedAt.IsZero() && p.Contract.MaxAgeSeconds > 0 {
+		s.Deadline = p.StartedAt.Add(time.Duration(p.Contract.MaxAgeSeconds) * time.Second)
+	}
+	states := map[string]string{}
+	mapped := map[string]bool{}
+	unfinished := map[string]bool{}
+	for _, st := range p.Steps {
+		states[st.ID] = st.State
+		for _, id := range st.RequirementIDs {
+			mapped[id] = true
+			if st.State != "succeeded" {
+				unfinished[id] = true
+			}
+		}
+		progress := StepProgress{ID: st.ID, Kind: st.Kind, State: st.State, ToolID: st.ToolID, ToolVersion: st.ToolVersion, ResultRef: st.ResultRef, EvidenceDigest: st.EvidenceDigest}
+		if st.State == "succeeded" {
+			s.Completed = append(s.Completed, progress)
+		}
+		if st.State == "failed" {
+			s.Failed = append(s.Failed, progress)
+		}
+		if st.State == "running" || st.State == "effect_unknown" {
+			s.Active = append(s.Active, progress)
+		}
+		if st.State == "effect_unknown" {
+			s.UnknownEffects = append(s.UnknownEffects, st.ID)
+		}
+	}
+	if p.Acceptance != nil {
+		for _, r := range p.Acceptance.Requirements {
+			if !mapped[r.ID] {
+				s.UnplannedRequirements = append(s.UnplannedRequirements, r.ID)
+			}
+			if !mapped[r.ID] || unfinished[r.ID] {
+				s.UnfinishedRequirements = append(s.UnfinishedRequirements, r.ID)
+			}
+		}
+	}
+	expired := !s.Deadline.IsZero() && !now.Before(s.Deadline)
+	for _, st := range p.Steps {
+		if st.State != "pending" {
+			continue
+		}
+		blocked := BlockedStep{ID: st.ID, Dependencies: []string{}}
+		for _, dep := range st.DependsOn {
+			if states[dep] != "succeeded" {
+				blocked.Dependencies = append(blocked.Dependencies, dep)
+			}
+		}
+		switch {
+		case p.Phase != "open":
+			blocked.Reason = "task_not_open"
+		case expired:
+			blocked.Reason = "deadline_exceeded"
+		case len(s.Failed) > 0:
+			blocked.Reason = "failed_step_must_resolve"
+		case len(blocked.Dependencies) > 0:
+			blocked.Reason = "dependencies_incomplete"
+		case len(s.Active) > 0:
+			blocked.Reason = "active_step_must_finish"
+		default:
+			s.Ready = append(s.Ready, st.ID)
+			continue
+		}
+		s.Blocked = append(s.Blocked, blocked)
+	}
+	switch {
+	case p.Phase == "failed":
+		s.NextAction = "stop_failed"
+	case p.Phase == "sealed":
+		s.NextAction = "resume_frozen_result"
+	case expired:
+		s.NextAction = "stop_deadline"
+	case len(s.UnknownEffects) > 0:
+		s.NextAction = "reconcile_unknown_effect"
+	case len(s.Failed) > 0:
+		s.NextAction = "inspect_failed_step"
+	case len(s.Active) > 0:
+		s.NextAction = "resume_active_step"
+	case len(s.UnplannedRequirements) > 0 || len(p.Steps) == 0:
+		s.NextAction = "plan_missing_obligations"
+	case len(s.Ready) > 0:
+		s.NextAction = "start_ready_step"
+	case len(s.Blocked) > 0:
+		s.NextAction = "inspect_blockers"
+	case s.NeedsFinalRepair:
+		s.NextAction = "repair_final_deliverable"
+	default:
+		s.NextAction = "validate_final_deliverable"
+	}
+	return s
+}
+```
+
+## 发布与观察代码：trpcservice/tool/requirements.go
+
+来源：`trpcservice/tool/requirements.go`，完整文件。职责、读取时序和边界见 design；这些读取不替代原工具执行授权。
+
+```go
+package tool
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/agentapp"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/profile"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
+)
+
+// ValidateTaskRequirements resolves metadata/build declarations only. It must
+// never invoke Call or execute the business operation while publishing.
+func (r Resolver) ValidateTaskRequirements(ctx context.Context, revision agentapp.Revision) error {
+	if err := revision.ValidateTaskRequirements(); err != nil {
+		return err
+	}
+	requirements, err := taskflow.ParseRequirements(revision.RuntimePolicy)
+	if err != nil {
+		return err
+	}
+	checked := map[string]bool{}
+	for _, required := range requirements {
+		if required.ToolID == "" || checked[required.ToolID] {
+			continue
+		}
+		var ref profile.VersionedRef
+		for _, pinned := range revision.ToolRefs {
+			if pinned.ID == required.ToolID && pinned.Version == required.ToolVersion {
+				ref = profile.VersionedRef{ID: pinned.ID, Version: pinned.Version, ContentDigest: pinned.ContentDigest}
+			}
+		}
+		values, e := r.ResolveTools(ctx, revision.TenantID, []profile.VersionedRef{ref})
+		if e != nil {
+			return fmt.Errorf("%w: task requirement %s tool unavailable: %w", agentapp.ErrInvalid, required.ID, e)
+		}
+		if len(values) != 1 {
+			return fmt.Errorf("%w: task requirement tool unavailable", agentapp.ErrInvalid)
+		}
+		descriptor, ok := values[0].(taskflow.EvidenceDescriptor)
+		if !ok || descriptor.TaskEvidenceCheck() == nil || !descriptor.TaskEvidenceCheck().Valid() {
+			return fmt.Errorf("%w: task requirement %s has no trusted completion check", agentapp.ErrInvalid, required.ID)
+		}
+		checked[required.ToolID] = true
+	}
+	return nil
+}
+```
+
+## 发布与观察代码：trpcservice/storage/messaging/postgres/task_incident.go
+
+来源：`trpcservice/storage/messaging/postgres/task_incident.go`，完整文件。职责、读取时序和边界见 design；这些读取不替代原工具执行授权。
+
+```go
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"strings"
+	"unicode"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+)
+
+func ValidateTaskIncidentKey(tenant, request string) error {
+	if strings.TrimSpace(tenant) == "" || len(tenant) > 256 || strings.TrimSpace(request) == "" || len(request) > 1024 || strings.IndexFunc(tenant, unicode.IsControl) >= 0 || strings.IndexFunc(request, unicode.IsControl) >= 0 {
+		return runtime.ErrInvalidEnvelope
+	}
+	return nil
+}
+
+// GetTaskIncident returns one statement snapshot of request-scoped metadata.
+// Bodies, arguments, notes, raw tool errors/handles and ciphertext are excluded.
+// Arrays are bounded; counts describe the entire request, not just the page.
+func (s *Store) GetTaskIncident(ctx context.Context, tenant, request string) (json.RawMessage, error) {
+	if err := ValidateTaskIncidentKey(tenant, request); err != nil {
+		return nil, err
+	}
+	var b []byte
+	err := s.db.QueryRowContext(ctx, taskIncidentSQL, tenant, request).Scan(&b)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, runtime.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(b), nil
+}
+
+const taskIncidentSQL = `WITH target AS (SELECT tenant_id,request_id FROM inbox WHERE tenant_id=$1 AND request_id=$2 UNION SELECT tenant_id,request_id FROM execution_record WHERE tenant_id=$1 AND request_id=$2) SELECT jsonb_build_object(
+'tenant_id',target.tenant_id,'request_id',target.request_id,'observed_at',now(),'array_limit',100,
+'inbox',(SELECT jsonb_build_object('channel',i.channel,'agent_app_id',i.agent_app_id,'session_id',i.session_id,'input_seq',i.input_seq,'state',i.state,'version',i.version,'created_at',i.created_at,'updated_at',i.updated_at) FROM inbox i WHERE i.tenant_id=$1 AND i.request_id=$2),
+'preprocess',(SELECT jsonb_build_object('job_id',p.job_id,'state',p.state,'attempt',p.attempt,'lease_owner',p.lease_owner,'lease_until',p.lease_until,'not_before',p.not_before) FROM preprocess_job p WHERE p.tenant_id=$1 AND p.request_id=$2),
+'execution',CASE WHEN e.request_id IS NULL THEN NULL ELSE jsonb_build_object('agent_app_id',e.agent_app_id,'session_id',e.session_id,'input_seq',e.input_seq,'outcome',e.outcome,'version',e.version,'model_calls',e.model_call_count,'model_request_attempts',e.model_request_count,'cancel_requested_at',e.cancel_requested_at,'blocked_reason',e.blocked_reason,'not_before',e.not_before) END,
+'plan',(SELECT jsonb_build_object('phase',p.phase,'version',p.version,'fence',p.fence,'updated_at',p.updated_at) FROM task_plan p WHERE p.tenant_id=$1 AND p.request_id=$2),
+'checkpoint_count',(SELECT count(*) FROM task_checkpoint c WHERE c.tenant_id=$1 AND c.request_id=$2),
+'attempt_count',(SELECT count(*) FROM execution_attempt a WHERE a.tenant_id=$1 AND a.request_id=$2),
+'attempts',(SELECT coalesce(jsonb_agg(q ORDER BY q.attempt_no DESC),'[]') FROM (SELECT attempt_no,worker_id,fence,state,started_at,finished_at FROM execution_attempt WHERE tenant_id=$1 AND request_id=$2 ORDER BY attempt_no DESC LIMIT 100) q),
+'tool_count',(SELECT count(*) FROM tool_execution t WHERE t.tenant_id=$1 AND t.request_id=$2),
+'tools',(SELECT coalesce(jsonb_agg(q ORDER BY (q.state<>'succeeded') DESC,q.updated_at DESC,q.tool_call_id),'[]') FROM (SELECT tool_call_id,tool_id,tool_version,state,recovery_policy,attempt,fence,lease_owner,lease_until,result_ref,(last_error IS NOT NULL AND last_error<>'') has_error,created_at,updated_at FROM tool_execution WHERE tenant_id=$1 AND request_id=$2 ORDER BY (state<>'succeeded') DESC,updated_at DESC,tool_call_id LIMIT 100) q),
+'completion',(SELECT jsonb_build_object('content_digest',c.content_digest,'envelope_digest',c.envelope_digest,'fence',c.fence,'created_at',c.created_at) FROM execution_completion c WHERE c.tenant_id=$1 AND c.request_id=$2),
+'commits',(SELECT coalesce(jsonb_agg(q ORDER BY q.created_at),'[]') FROM (SELECT commit_id,stage,outcome,fence,created_at FROM session_commit WHERE tenant_id=$1 AND request_id=$2 ORDER BY created_at DESC LIMIT 100) q),
+'outbox_count',(SELECT count(*) FROM outbox o WHERE o.tenant_id=$1 AND o.aggregate_id=$2),
+'outbox',(SELECT coalesce(jsonb_agg(q ORDER BY (q.state<>'published') DESC,q.created_at,q.outbox_id),'[]') FROM (SELECT outbox_id,kind,idempotency_key,state,version,attempt,claim_owner,claim_until,next_attempt_at,created_at FROM outbox WHERE tenant_id=$1 AND aggregate_id=$2 ORDER BY (state<>'published') DESC,created_at,outbox_id LIMIT 100) q),
+'delivery_count',(SELECT count(*) FROM delivery_ledger d WHERE d.tenant_id=$1 AND EXISTS(SELECT 1 FROM outbox o WHERE o.tenant_id=$1 AND o.aggregate_id=$2 AND o.kind='reply' AND o.idempotency_key=d.delivery_key)),
+'deliveries',(SELECT coalesce(jsonb_agg(q ORDER BY (q.state<>'sent') DESC,q.updated_at DESC,q.delivery_key,q.segment_no),'[]') FROM (SELECT d.delivery_key,d.segment_no,d.state,d.version,d.attempt,d.reconcile_attempt,d.last_error_class,d.provider_message_id,d.claim_owner,d.claim_until,d.updated_at,EXISTS(SELECT 1 FROM delivery_receipt r WHERE r.tenant_id=$1 AND r.delivery_key=d.delivery_key AND r.segment_no=d.segment_no) has_receipt FROM delivery_ledger d WHERE d.tenant_id=$1 AND EXISTS(SELECT 1 FROM outbox o WHERE o.tenant_id=$1 AND o.aggregate_id=$2 AND o.kind='reply' AND o.idempotency_key=d.delivery_key) ORDER BY (d.state<>'sent') DESC,d.updated_at DESC,d.delivery_key,d.segment_no LIMIT 100) q)
+) FROM target LEFT JOIN execution_record e ON e.tenant_id=target.tenant_id AND e.request_id=target.request_id`
 ```

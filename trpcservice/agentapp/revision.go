@@ -148,6 +148,9 @@ type Revision struct {
 }
 
 func (r Revision) ValidateDraft() error {
+	if err := r.ValidateTaskRequirements(); err != nil {
+		return err
+	}
 	if r.TenantID == "" || r.AgentAppID == "" || r.Revision < 1 ||
 		r.DraftVersion < 1 || r.SchemaVersion != 1 {
 		return fmt.Errorf("%w: incomplete or unsupported revision", ErrInvalid)

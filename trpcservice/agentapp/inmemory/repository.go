@@ -17,10 +17,11 @@ type revisionKey struct {
 }
 
 type Repository struct {
-	mu        sync.RWMutex
-	apps      map[appKey]agentapp.AgentApp
-	appKeys   map[string]appKey
-	revisions map[revisionKey]agentapp.Revision
+	Requirements agentapp.RequirementValidator
+	mu           sync.RWMutex
+	apps         map[appKey]agentapp.AgentApp
+	appKeys      map[string]appKey
+	revisions    map[revisionKey]agentapp.Revision
 }
 
 func New() *Repository {
@@ -229,7 +230,7 @@ func (r *Repository) Publish(ctx context.Context, in agentapp.PublishInput) (age
 	if rev.DraftVersion != in.ExpectedDraftVersion {
 		return agentapp.PublishResult{}, agentapp.ErrVersionConflict
 	}
-	if err := rev.ValidateDraft(); err != nil {
+	if err := agentapp.ValidatePublication(ctx, rev, r.Requirements); err != nil {
 		return agentapp.PublishResult{}, err
 	}
 	digest, err := rev.ComputeContentDigest()
